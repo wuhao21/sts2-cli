@@ -194,6 +194,9 @@ public class RunSimulator
     private readonly ManualResetEventSlim _turnStarted = new(false);
     private readonly ManualResetEventSlim _combatEnded = new(false);
     private static readonly LocLookup _loc = new();
+    // Var names that represent card-category labels (map to CARD_TYPE.* in gameplay_ui)
+    private static readonly HashSet<string> _cardTypeVarNames = new(StringComparer.OrdinalIgnoreCase)
+        { "Attack", "Curse", "Power", "Quest", "Skill", "Status" };
     private bool _eventOptionChosen;
     private int _lastEventOptionCount;
 
@@ -1773,7 +1776,12 @@ public class RunSimulator
                     {
                         optVars = new Dictionary<string, object?>();
                         foreach (var dv in localEvent.DynamicVars.Values)
-                            optVars[dv.Name] = (int)dv.BaseValue;
+                        {
+                            if (_cardTypeVarNames.Contains(dv.Name))
+                                optVars[dv.Name] = _loc.Bilingual("gameplay_ui", "CARD_TYPE." + dv.Name.ToUpperInvariant());
+                            else
+                                optVars[dv.Name] = (int)dv.BaseValue;
+                        }
                     }
                 }
                 catch { }
@@ -1790,7 +1798,12 @@ public class RunSimulator
                             optVars ??= new Dictionary<string, object?>();
                             var mutable = relicModel.ToMutable();
                             foreach (var dv in mutable.DynamicVars.Values)
-                                optVars[dv.Name] = (int)dv.BaseValue;
+                            {
+                                if (_cardTypeVarNames.Contains(dv.Name))
+                                    optVars[dv.Name] = _loc.Bilingual("gameplay_ui", "CARD_TYPE." + dv.Name.ToUpperInvariant());
+                                else
+                                    optVars[dv.Name] = (int)dv.BaseValue;
+                            }
                         }
                     }
                     catch { }
@@ -1871,30 +1884,52 @@ public class RunSimulator
         if (inv == null) { ForceToMap(); return MapSelectState(); }
 
         var cards = inv.CharacterCardEntries.Concat(inv.ColorlessCardEntries)
-            .Select((e, i) => new Dictionary<string, object?>
+            .Select((e, i) =>
             {
-                ["index"] = i,
-                ["name"] = _loc.Card(e.CreationResult?.Card?.Id.Entry ?? "?"),
-                ["type"] = e.CreationResult?.Card?.Type.ToString() ?? "?",
-                ["cost"] = e.Cost,
-                ["is_stocked"] = e.IsStocked,
-                ["on_sale"] = e.IsOnSale,
+                var card = e.CreationResult?.Card;
+                var stats = new Dictionary<string, object?>();
+                try { if (card != null) foreach (var dv in card.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
+                return new Dictionary<string, object?>
+                {
+                    ["index"] = i,
+                    ["name"] = _loc.Card(card?.Id.Entry ?? "?"),
+                    ["type"] = card?.Type.ToString() ?? "?",
+                    ["cost"] = e.Cost,
+                    ["is_stocked"] = e.IsStocked,
+                    ["on_sale"] = e.IsOnSale,
+                    ["description"] = _loc.Bilingual("cards", (card?.Id.Entry ?? "?") + ".description"),
+                    ["stats"] = stats.Count > 0 ? stats : null,
+                };
             }).ToList();
 
-        var relics = inv.RelicEntries.Select((e, i) => new Dictionary<string, object?>
+        var relics = inv.RelicEntries.Select((e, i) =>
         {
-            ["index"] = i,
-            ["name"] = _loc.Relic(e.Model?.Id.Entry ?? "?"),
-            ["cost"] = e.Cost,
-            ["is_stocked"] = e.IsStocked,
+            var vars = new Dictionary<string, object?>();
+            try { if (e.Model != null) foreach (var dv in e.Model.DynamicVars.Values) vars[dv.Name] = (int)dv.BaseValue; } catch { }
+            return new Dictionary<string, object?>
+            {
+                ["index"] = i,
+                ["name"] = _loc.Relic(e.Model?.Id.Entry ?? "?"),
+                ["cost"] = e.Cost,
+                ["is_stocked"] = e.IsStocked,
+                ["description"] = _loc.Bilingual("relics", (e.Model?.Id.Entry ?? "?") + ".description"),
+                ["vars"] = vars.Count > 0 ? vars : null,
+            };
         }).ToList();
 
-        var potions = inv.PotionEntries.Select((e, i) => new Dictionary<string, object?>
+        var potions = inv.PotionEntries.Select((e, i) =>
         {
-            ["index"] = i,
-            ["name"] = _loc.Potion(e.Model?.Id.Entry ?? "?"),
-            ["cost"] = e.Cost,
-            ["is_stocked"] = e.IsStocked,
+            var vars = new Dictionary<string, object?>();
+            try { if (e.Model != null) foreach (var dv in e.Model.DynamicVars.Values) vars[dv.Name] = (int)dv.BaseValue; } catch { }
+            return new Dictionary<string, object?>
+            {
+                ["index"] = i,
+                ["name"] = _loc.Potion(e.Model?.Id.Entry ?? "?"),
+                ["cost"] = e.Cost,
+                ["is_stocked"] = e.IsStocked,
+                ["description"] = _loc.Bilingual("potions", (e.Model?.Id.Entry ?? "?") + ".description"),
+                ["vars"] = vars.Count > 0 ? vars : null,
+            };
         }).ToList();
 
         var removal = merchantRoom.Inventory.CardRemovalEntry;

@@ -108,8 +108,18 @@ if [ -z "$DOTNET" ]; then
     exit 1
 fi
 
+DOTNET_VERSION=$($DOTNET --version 2>/dev/null)
+DOTNET_MAJOR=$(echo "$DOTNET_VERSION" | cut -d'.' -f1)
+
+if [ -z "$DOTNET_MAJOR" ] || [ "$DOTNET_MAJOR" -lt 9 ] 2>/dev/null; then
+    echo ""
+    echo "❌ .NET SDK $DOTNET_VERSION is too old. .NET 9+ is required."
+    echo "   Install .NET 9+ from https://dotnet.microsoft.com/download"
+    exit 1
+fi
+
 echo ""
-echo "🔧 .NET SDK: $DOTNET ($($DOTNET --version))"
+echo "🔧 .NET SDK: $DOTNET ($DOTNET_VERSION)"
 
 # ── IL Patch sts2.dll ──
 
@@ -118,17 +128,22 @@ echo "🔨 Applying IL patches to sts2.dll..."
 
 # Create a temporary patching project
 PATCH_DIR=$(mktemp -d)
+# Use the installed .NET major version for the patcher project
+NET_TFM="net${DOTNET_MAJOR}.0"
+
 cat > "$PATCH_DIR/Patcher.csproj" << 'PROJ'
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>DOTNET_TFM_PLACEHOLDER</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Mono.Cecil" Version="0.11.6" />
   </ItemGroup>
 </Project>
 PROJ
+sed -i.bak "s|DOTNET_TFM_PLACEHOLDER|${NET_TFM}|" "$PATCH_DIR/Patcher.csproj"
+rm -f "$PATCH_DIR/Patcher.csproj.bak"
 
 cat > "$PATCH_DIR/Program.cs" << 'CSHARP'
 using System;
@@ -142,9 +157,11 @@ Console.WriteLine($"Patching {dllPath}...");
 var resolver = new DefaultAssemblyResolver();
 var libDir = Path.GetDirectoryName(dllPath)!;
 resolver.AddSearchDirectory(libDir);
-// Also search for GodotSharp.dll in the GodotStubs output (fallback)
-var stubsDir = Path.Combine(Path.GetDirectoryName(libDir)!, "GodotStubs", "bin", "Debug", "net9.0");
-if (Directory.Exists(stubsDir)) resolver.AddSearchDirectory(stubsDir);
+// Also search for GodotSharp.dll in the GodotStubs output (any net* TFM)
+var stubsBase = Path.Combine(Path.GetDirectoryName(libDir)!, "GodotStubs", "bin", "Debug");
+if (Directory.Exists(stubsBase))
+    foreach (var d in Directory.GetDirectories(stubsBase, "net*"))
+        resolver.AddSearchDirectory(d);
 var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters {
     AssemblyResolver = resolver,
     ReadingMode = ReadingMode.Deferred  // Don't force-resolve all references upfront

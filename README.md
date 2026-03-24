@@ -24,11 +24,37 @@ cd sts2-cli
 
 Or just run `python3 python/play.py` — it auto-detects and sets up on first run.
 
+### Optional: zsh alias (macOS)
+
+Add to `~/.zshrc` for a quick `sts2` shortcut:
+
+```zsh
+alias sts2='uv run python3 /path/to/sts2-cli/python/play.py'
+```
+
+Then `source ~/.zshrc` and use `sts2` instead of the full command.
+
 ## Play
 
 ```bash
-python3 python/play.py                # interactive (Chinese)
-python3 python/play.py --lang en      # interactive (English)
+python3 python/play.py                    # Ironclad, Ascension 0
+python3 python/play.py d 4                # Defect, Ascension 4
+python3 python/play.py s 10 --lang en     # Silent, Ascension 10, English
+```
+
+### Character & Ascension
+
+| Flag | Short | Positional | Example |
+|---|---|---|---|
+| `--character` | `-c` | first non-number arg | `sts2 d` |
+| `--ascension` | `-a` | first number arg | `sts2 7` |
+
+Character abbreviations: `i` Ironclad, `s` Silent, `d` Defect, `r` Regent, `n` Necrobinder (case-insensitive).
+
+```bash
+python3 python/play.py d 4        # positional
+python3 python/play.py -c d -a 4  # flags
+python3 python/play.py -c Defect --ascension 4  # full names
 ```
 
 Type `help` in-game:
@@ -41,13 +67,22 @@ Type `help` in-game:
   relics   — show relics
   quit     — quit
 
-  Map:     enter path number (0, 1, 2)
-  Combat:  card index / e (end turn) / p0 (use potion)
+  Map:     path number (1, 2, 3...)
+  Combat:  card index / e (end turn) / p1 (use potion 1)
   Reward:  card index / s (skip)
   Rest:    option index
   Event:   option index / leave
-  Shop:    c0 (card) / r0 (relic) / p0 (potion) / rm (remove) / leave
+  Shop:    c1 (card) / r1 (relic) / p1 (potion) / rm (remove) / leave
 ```
+
+All indices start from **1**. For selections requiring multiple cards (e.g. an event asking you to remove 2), enter indices separated by commas or spaces:
+
+```
+> Choose 2-2 card(s) [index]: 1,3
+> Choose 2-2 card(s) [index]: 1 3
+```
+
+The prompt shows the required count range. Invalid indices or wrong counts are rejected with an explanation.
 
 ## JSON Protocol
 
@@ -92,6 +127,10 @@ sts2.dll (game engine, IL patched)
   + Harmony patches (localization)
 ```
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
+
 </details>
 
 <details>
@@ -118,11 +157,37 @@ cd sts2-cli
 
 或者直接运行 `python3 python/play.py`，首次会自动完成 setup。
 
+### 可选：zsh 快捷别名（macOS）
+
+在 `~/.zshrc` 中添加：
+
+```zsh
+alias sts2='uv run python3 /path/to/sts2-cli/python/play.py'
+```
+
+然后 `source ~/.zshrc`，之后可以直接用 `sts2` 代替完整命令。
+
 ## 玩
 
 ```bash
-python3 python/play.py              # 中文交互模式
-python3 python/play.py --lang en    # English
+python3 python/play.py                    # 铁甲战士，进阶 0
+python3 python/play.py d 4                # 故障机器人，进阶 4
+python3 python/play.py s 10 --lang en     # 静默猎手，进阶 10，英文
+```
+
+### 角色与进阶
+
+| 完整参数 | 短参数 | 位置参数 | 示例 |
+|---|---|---|---|
+| `--character` | `-c` | 第一个非数字参数 | `sts2 d` |
+| `--ascension` | `-a` | 第一个数字参数 | `sts2 7` |
+
+角色缩写：`i` 铁甲战士, `s` 静默猎手, `d` 故障机器人, `r` 储君, `n` 亡灵契约师（大小写不敏感）。
+
+```bash
+python3 python/play.py d 4        # 位置参数
+python3 python/play.py -c d -a 4  # 短参数
+python3 python/play.py -c Defect --ascension 4  # 完整参数
 ```
 
 游戏内输入 `help` 查看所有命令：
@@ -135,13 +200,22 @@ python3 python/play.py --lang en    # English
   relics   — 查看遗物
   quit     — 退出
 
-  地图:    输入编号 (0, 1, 2)
-  战斗:    输入卡牌编号 / e 结束回合 / p0 使用药水
+  地图:    输入编号 (1, 2, 3...)
+  战斗:    输入卡牌编号 / e 结束回合 / p1 使用药水1
   奖励:    输入卡牌编号 / s 跳过
   休息:    输入选项编号
   事件:    输入选项编号 / leave 离开
-  商店:    c0 买卡 / r0 买遗物 / p0 买药水 / rm 移除 / leave 离开
+  商店:    c1 买卡 / r1 买遗物 / p1 买药水 / rm 移除 / leave 离开
 ```
+
+所有编号从 **1** 开始。需要选择多张卡牌时（如某些事件要求移除2张），用逗号或空格分隔编号：
+
+```
+> 选择 2-2 张卡牌 [编号]: 1,3
+> 选择 2-2 张卡牌 [编号]: 1 3
+```
+
+提示语会显示所需数量范围，输入无效编号或数量不符时会给出说明并重新提示。
 
 ## 角色支持
 
@@ -185,5 +259,9 @@ sts2.dll (游戏引擎, IL patched)
   + GodotStubs (替代 GodotSharp.dll)
   + Harmony patches (本地化)
 ```
+
+## 更新日志
+
+参见 [CHANGELOG.md](CHANGELOG.md)。
 
 </details>

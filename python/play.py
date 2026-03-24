@@ -10,6 +10,7 @@ Usage:
 """
 
 import json
+import re
 import subprocess
 import sys
 import os
@@ -233,11 +234,16 @@ def desc(obj):
 COLORS = {
     "red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m",
     "blue": "\033[94m", "magenta": "\033[95m", "cyan": "\033[96m",
-    "bold": "\033[1m", "dim": "\033[2m", "reset": "\033[0m",
+    "orange": "\033[33m",
+    "bold": "\033[1m", "dim": "\033[2m", "underline": "\033[4m", "reset": "\033[0m",
 }
 
 def c(text, color):
     return f"{COLORS.get(color, '')}{text}{COLORS['reset']}"
+
+def cu(text, color=None):
+    """Color + underline — used for available choice labels."""
+    return f"{COLORS['underline']}{COLORS.get(color, '')}{text}{COLORS['reset']}"
 
 def bar(current, maximum, width=20):
     filled = int(current / max(maximum, 1) * width)
@@ -257,6 +263,12 @@ RARITY_ZH = {"Common": "普通", "Uncommon": "罕见", "Rare": "稀有"}
 CARD_TYPE_ZH = {"Attack": "攻击", "Skill": "技能", "Power": "能力", "Status": "状态", "Curse": "诅咒"}
 NODE_TYPE_ZH = {"Monster": "怪物", "Elite": "精英", "Boss": "Boss", "RestSite": "休息处",
                 "Shop": "商店", "Treasure": "宝箱", "Event": "事件", "Unknown": "未知", "Ancient": "远古"}
+
+NODE_COLORS = {
+    "Elite": "magenta", "RestSite": "green", "Shop": "yellow",
+    "Treasure": "orange", "Event": "blue", "Unknown": "blue",
+    "Ancient": "orange",
+}
 
 # ─── Game display ───
 
@@ -281,6 +293,8 @@ def resolve_template(text, vars_dict):
         kl = key.lower()
         val = lower_vars.get(kl)
         if val is not None:
+            if isinstance(val, dict) and ("en" in val or "zh" in val):
+                return n(val)
             return str(val)
         # Special vars
         if kl == "energyprefix":
@@ -312,7 +326,7 @@ def potion_str(p):
         d = desc(p.get("description", {}))
         vars_dict = p.get("vars") or {}
         d = resolve_template(d, vars_dict) if vars_dict else d
-        idx = p.get("index", "?")
+        idx = p.get("index", 0) + 1
         return f"[{idx}] {name}" + (f": {c(d, 'dim')}" if d else "")
     return n(p)
 
@@ -447,7 +461,7 @@ def show_combat(state):
             pw_parts = [f"{n(pw['name'])}{pw.get('amount','')}" for pw in powers]
             power_str = "  " + c(" ".join(pw_parts), "dim")
 
-        print(f"  [{e['index']}] {n(e['name'])}  {bar(hp, mhp)} {hp}/{mhp}"
+        print(f"  [{e['index']+1}] {n(e['name'])}  {bar(hp, mhp)} {hp}/{mhp}"
               + (f"  {c(str(blk), 'blue')}{t('blk','挡')}" if blk else "")
               + f"  {intent_str}{power_str}")
 
@@ -493,12 +507,12 @@ def show_combat(state):
         ench = card.get("enchantment")
         ench_str = f" {c(n(ench), 'magenta')}" if ench else ""
 
-        print(f"  {mark} [{card['index']}] {c(n(card['name']), type_color)}{ench_str} ({cost_str}) {stat_str}{kw_str}{extra_desc}"
+        print(f"  {mark} [{card['index']+1}] {c(n(card['name']), type_color)}{ench_str} ({cost_str}) {stat_str}{kw_str}{extra_desc}"
               + (f"  {c('→','yellow')}" if target == "AnyEnemy" else ""))
 
 def show_map(state, send_fn=None):
     """Show map at map_select. Fetches full map if send_fn available."""
-    choices = state.get("choices", [])
+    choices = sorted(state.get("choices", []), key=lambda ch: ch["col"])
     choice_set = {(ch["col"], ch["row"]) for ch in choices}
 
     # Try to fetch full map for richer display
@@ -513,10 +527,12 @@ def show_map(state, send_fn=None):
                 "Event": "❓", "Unknown": "❓", "Ancient": "🏛",
             }
             print(f"  {c(t('Available paths:','可选路径:'), 'bold')}")
-            for i, ch in enumerate(choices):
+            for i, ch in enumerate(choices, 1):
                 icon = type_icons.get(ch["type"], "?")
                 ntype = t(ch["type"], NODE_TYPE_ZH.get(ch["type"], ch["type"]))
-                print(f"    [{i}] {c(icon, 'yellow')} {ntype}  ({t('col','列')}{ch['col']}, {t('row','行')}{ch['row']})")
+                col = NODE_COLORS.get(ch["type"])
+                label = c(f"{icon} {ntype}", col) if col else f"{icon} {ntype}"
+                print(f"    [{i}] {label}  ({t('col','列')}{ch['col']}, {t('row','行')}{ch['row']})")
             return
 
     # Fallback: simple list
@@ -532,10 +548,12 @@ def show_map(state, send_fn=None):
         "RestSite": "🏕", "Shop": "🏪", "Treasure": "💎",
         "Event": "❓", "Unknown": "❓", "Ancient": "🏛",
     }
-    for i, ch in enumerate(choices):
+    for i, ch in enumerate(choices, 1):
         icon = type_icons.get(ch["type"], "?")
         ntype = t(ch["type"], NODE_TYPE_ZH.get(ch["type"], ch["type"]))
-        print(f"  [{i}] {icon} {ntype}")
+        col = NODE_COLORS.get(ch["type"])
+        label = c(f"{icon} {ntype}", col) if col else f"{icon} {ntype}"
+        print(f"  [{i}] {label}")
 
 def _format_upgrade_preview(stats, aug, current_cost=None):
     """Format upgrade preview string."""
@@ -586,7 +604,7 @@ def show_card_reward(state):
         stats = card.get("stats") or {}
         cd_desc = card_desc(card)
 
-        print(f"  [{card['index']}] {c(n(card['name']), type_color)} ({cost}) {c(rarity_label, rarity_color)}")
+        print(f"  [{card['index']+1}] {c(n(card['name']), type_color)} ({cost}) {c(rarity_label, rarity_color)}")
         if cd_desc:
             print(f"      {c(cd_desc, 'dim')}")
         # Show upgrade preview
@@ -607,21 +625,29 @@ def show_shop(state):
         affordable = c(str(cost), "green") if cost <= gold else c(str(cost), "red")
         sale = c(t(" SALE"," 打折"), "yellow") if card.get("on_sale") else ""
         ctype_zh = CARD_TYPE_ZH.get(card.get("type",""), card.get("type",""))
-        print(f"  [{card['index']}] {n(card['name'])} ({t(card.get('type','?'), ctype_zh)}) — {affordable}{t('g','金')}{sale}")
+        cd = card_desc(card)
+        desc_str = f" — {c(cd, 'dim')}" if cd else ""
+        print(f"  [{card['index']+1}] {n(card['name'])} ({t(card.get('type','?'), ctype_zh)}){desc_str} — {affordable}{t('g','金')}{sale}")
 
     print(f"\n  {c(t('Relics:','遗物:'), 'bold')}")
     for r in state.get("relics", []):
         if not r.get("is_stocked"): continue
         cost = r.get("cost", 0)
         affordable = c(str(cost), "green") if cost <= gold else c(str(cost), "red")
-        print(f"  [r{r['index']}] {n(r['name'])} — {affordable}{t('g','金')}")
+        d = desc(r.get("description", {}))
+        d = resolve_template(d, r.get("vars") or {})
+        desc_str = f": {c(d, 'dim')}" if d else ""
+        print(f"  [r{r['index']+1}] {n(r['name'])}{desc_str} — {affordable}{t('g','金')}")
 
     print(f"\n  {c(t('Potions:','药水:'), 'bold')}")
     for p in state.get("potions", []):
         if not p.get("is_stocked"): continue
         cost = p.get("cost", 0)
         affordable = c(str(cost), "green") if cost <= gold else c(str(cost), "red")
-        print(f"  [p{p['index']}] {n(p['name'])} — {affordable}{t('g','金')}")
+        d = desc(p.get("description", {}))
+        d = resolve_template(d, p.get("vars") or {})
+        desc_str = f": {c(d, 'dim')}" if d else ""
+        print(f"  [p{p['index']+1}] {n(p['name'])}{desc_str} — {affordable}{t('g','金')}")
 
     removal_cost = state.get("card_removal_cost")
     if removal_cost:
@@ -646,7 +672,7 @@ def show_rest_site(state):
         opt_id = opt.get("option_id", "?")
         opt_name = t(opt_id, REST_OPTIONS_ZH.get(opt_id, opt_id))
         opt_desc = opt.get("name", "")
-        print(f"  {mark} [{opt['index']}] {opt_name}" + (f" — {opt_desc}" if opt_desc and opt_desc != opt_id else ""))
+        print(f"  {mark} [{opt['index']+1}] {opt_name}" + (f" — {opt_desc}" if opt_desc and opt_desc != opt_id else ""))
 
 def _load_loc():
     """Load localization data for resolving event option names."""
@@ -735,7 +761,7 @@ def show_event(state):
         if opt_vars and opt_desc:
             opt_desc = resolve_template(opt_desc, opt_vars)
         desc_str = f" — {c(opt_desc, 'dim')}" if opt_desc else ""
-        print(f"  {mark} [{opt['index']}] {title}{desc_str}")
+        print(f"  {mark} [{opt['index']+1}] {title}{desc_str}")
 
 # ─── Input handling ───
 
@@ -785,10 +811,15 @@ def _render_map(map_data, choice_set=None):
     # Show current position if it's not on the map grid (e.g., starting row 0)
     if cur and cur.get("row", -1) not in row_numbers:
         print(f"  {c(t('You are at the start','你在起点'), 'green')}")
-    print()
+
+    # Boss name header
+    boss = map_data.get("boss", {})
+    boss_name = n(boss.get("name")) if boss.get("name") else None
+    if boss_name:
+        print(f"  {c('B', 'red')}={t('Boss','Boss')}: {c(boss_name, 'red')}")
+    print(f"  {'─' * width}")
 
     # Boss row
-    boss = map_data.get("boss", {})
     boss_col = boss.get("col", 0)
     boss_row = boss.get("row", -1)
     buf = list(" " * (W * total_cols))
@@ -825,7 +856,9 @@ def _render_map(map_data, choice_set=None):
             nd = node_map.get((col, rn))
             if not nd:
                 continue
-            icon = ICONS.get(nd.get("type", "?"), "·")
+            ntype = nd.get("type", "?")
+            icon = ICONS.get(ntype, "·")
+            node_color = NODE_COLORS.get(ntype)
             is_cur = (cur and cur["col"] == col and cur["row"] == rn)
             is_choice = (col, rn) in choice_set
             visited = nd.get("visited", False)
@@ -838,10 +871,13 @@ def _render_map(map_data, choice_set=None):
                 color_subs.append((center - 1, center + 2, c(f"[{icon}]", "green")))
             elif is_choice:
                 buf[center] = icon
-                color_subs.append((center, center + 1, c(icon, "yellow")))
+                color_subs.append((center, center + 1, cu(icon, node_color)))
             elif visited:
                 buf[center] = icon
                 color_subs.append((center, center + 1, c(icon, "dim")))
+            elif node_color:
+                buf[center] = icon
+                color_subs.append((center, center + 1, c(icon, node_color)))
             else:
                 buf[center] = icon
 
@@ -871,7 +907,10 @@ def _render_map(map_data, choice_set=None):
 
     # Legend
     print(f"  {'─' * width}")
-    legend = f"  {c('M','red')}={t('Monster','怪')} {c('E','red')}={t('Elite','英')} R={t('Rest','休')} $={t('Shop','店')} T={t('Treasure','宝')} ?={t('Event','事')} {c('[x]','green')}={t('You','你')} {c('x','yellow')}={t('Next','可选')}"
+    legend = (f"  M={t('Monster','怪')} {c('E','magenta')}={t('Elite','英')} {c('R','green')}={t('Rest','休')}"
+              f" {c('$','yellow')}={t('Shop','店')} {c('T','orange')}={t('Treasure','宝')}"
+              f" {c('?','blue')}={t('Event','事')} {c('A','orange')}={t('Ancient','远古')}"
+              f" {c('[x]','green')}={t('You','你')} {cu('x')}={t('Next','可选')}")
     print(legend)
     print()
 
@@ -891,6 +930,92 @@ def _draw_conn(buf, from_col, to_col, W):
         if 0 <= mid < len(buf):
             buf[mid] = ch
 
+def _handle_meta(raw, state=None):
+    """Handle meta-commands (help, map, deck, potions, relics, quit).
+    Returns True if the command was handled (caller should continue loop), False otherwise."""
+    if raw == "help":
+        if LANG == "zh":
+            print(f"""
+  {c('命令:', 'bold')}
+    {c('help', 'cyan')}     — 帮助
+    {c('map', 'cyan')}      — 显示地图
+    {c('deck', 'cyan')}     — 查看牌组
+    {c('potions', 'cyan')}  — 查看药水
+    {c('relics', 'cyan')}   — 查看遗物
+    {c('quit', 'cyan')}     — 退出
+
+  {c('操作:', 'bold')}
+    地图:    输入路径编号 (1, 2, 3)
+    战斗:    卡牌编号 / {c('e', 'yellow')} 结束回合 / {c('p1', 'yellow')} 使用药水
+    奖励:    卡牌编号 / {c('s', 'yellow')} 跳过
+    休息:    选项编号
+    事件:    选项编号 / {c('leave', 'yellow')} 离开
+    商店:    {c('c1', 'yellow')} 买卡 / {c('r1', 'yellow')} 遗物 / {c('p1', 'yellow')} 药水 / {c('rm', 'yellow')} 移除 / {c('leave', 'yellow')} 离开
+""")
+        else:
+            print(f"""
+  {c('Commands:', 'bold')}
+    {c('help', 'cyan')}     — show this help
+    {c('map', 'cyan')}      — show map
+    {c('deck', 'cyan')}     — show deck
+    {c('potions', 'cyan')}  — show potions
+    {c('relics', 'cyan')}   — show relics
+    {c('quit', 'cyan')}     — quit
+
+  {c('Actions:', 'bold')}
+    Map:     path number (1, 2, 3)
+    Combat:  card index / {c('e', 'yellow')} end turn / {c('p1', 'yellow')} use potion
+    Reward:  card index / {c('s', 'yellow')} skip
+    Rest:    option index
+    Event:   option index / {c('leave', 'yellow')} leave
+    Shop:    {c('c1', 'yellow')} card / {c('r1', 'yellow')} relic / {c('p1', 'yellow')} potion / {c('rm', 'yellow')} remove / {c('leave', 'yellow')} leave
+""")
+        return True
+    if raw == "deck" and state:
+        show_player(state.get("player", {}), show_deck=True)
+        return True
+    if raw == "potions" and state:
+        pots = state.get("player", {}).get("potions", [])
+        if pots:
+            for pot in pots:
+                if pot: print(f"  🧪 {potion_str(pot)}")
+        else:
+            print(f"  {t('No potions.','没有药水。')}")
+        return True
+    if raw == "relics" and state:
+        for r in state.get("player", {}).get("relics", []):
+            print(f"  🔶 {relic_str(r)}")
+        return True
+    if raw == "map":
+        if hasattr(get_input, '_send'):
+            map_data = get_input._send({"cmd": "get_map"})
+            if map_data and map_data.get("type") == "map":
+                # Build choice_set: use state choices if at map_select, else
+                # derive from current node's children in the map data
+                choice_set = set()
+                if state and state.get("decision") == "map_select":
+                    for ch in state.get("choices", []):
+                        choice_set.add((ch["col"], ch["row"]))
+                else:
+                    cur = map_data.get("current_coord")
+                    if cur:
+                        for row in map_data.get("rows", []):
+                            for nd in row:
+                                if nd.get("col") == cur["col"] and nd.get("row") == cur["row"]:
+                                    for child in (nd.get("children") or []):
+                                        choice_set.add((child["col"], child["row"]))
+                _render_map(map_data, choice_set)
+            else:
+                print("  Map not available.")
+        elif state:
+            ctx = state.get("context", {})
+            print(f"  {c(n(ctx.get('act_name','?')), 'bold')} Floor {ctx.get('floor','?')}")
+        return True
+    if raw == "quit":
+        print(t("Quitting...","退出..."))
+        sys.exit(0)
+    return False
+
 def get_input(prompt, valid_options=None, state=None):
     """Get user input with validation. Supports meta-commands: help, map, deck, potions."""
     while True:
@@ -902,80 +1027,8 @@ def get_input(prompt, valid_options=None, state=None):
 
         if not raw:
             continue
-
-        # Meta-commands available at any prompt
-        if raw == "help":
-            if LANG == "zh":
-                print(f"""
-  {c('命令:', 'bold')}
-    {c('help', 'cyan')}     — 帮助
-    {c('map', 'cyan')}      — 显示地图
-    {c('deck', 'cyan')}     — 查看牌组
-    {c('potions', 'cyan')}  — 查看药水
-    {c('relics', 'cyan')}   — 查看遗物
-    {c('quit', 'cyan')}     — 退出
-
-  {c('操作:', 'bold')}
-    地图:    输入路径编号 (0, 1, 2)
-    战斗:    卡牌编号 / {c('e', 'yellow')} 结束回合 / {c('p0', 'yellow')} 使用药水
-    奖励:    卡牌编号 / {c('s', 'yellow')} 跳过
-    休息:    选项编号
-    事件:    选项编号 / {c('leave', 'yellow')} 离开
-    商店:    {c('c0', 'yellow')} 买卡 / {c('r0', 'yellow')} 遗物 / {c('p0', 'yellow')} 药水 / {c('rm', 'yellow')} 移除 / {c('leave', 'yellow')} 离开
-""")
-            else:
-                print(f"""
-  {c('Commands:', 'bold')}
-    {c('help', 'cyan')}     — show this help
-    {c('map', 'cyan')}      — show map
-    {c('deck', 'cyan')}     — show deck
-    {c('potions', 'cyan')}  — show potions
-    {c('relics', 'cyan')}   — show relics
-    {c('quit', 'cyan')}     — quit
-
-  {c('Actions:', 'bold')}
-    Map:     path number (0, 1, 2)
-    Combat:  card index / {c('e', 'yellow')} end turn / {c('p0', 'yellow')} use potion
-    Reward:  card index / {c('s', 'yellow')} skip
-    Rest:    option index
-    Event:   option index / {c('leave', 'yellow')} leave
-    Shop:    {c('c0', 'yellow')} card / {c('r0', 'yellow')} relic / {c('p0', 'yellow')} potion / {c('rm', 'yellow')} remove / {c('leave', 'yellow')} leave
-""")
+        if _handle_meta(raw, state):
             continue
-        if raw == "deck" and state:
-            p = state.get("player", {})
-            show_player(p, show_deck=True)
-            continue
-        if raw == "potions" and state:
-            p = state.get("player", {})
-            pots = p.get("potions", [])
-            if pots:
-                for pot in pots:
-                    if pot: print(f"  🧪 {potion_str(pot)}")
-            else:
-                print(f"  {t('No potions.','没有药水。')}")
-            continue
-        if raw == "relics" and state:
-            p = state.get("player", {})
-            for r in p.get("relics", []):
-                print(f"  🔶 {relic_str(r)}")
-            continue
-        if raw == "map":
-            # Fetch full map from CLI
-            if hasattr(get_input, '_send'):
-                map_data = get_input._send({"cmd": "get_map"})
-                if map_data and map_data.get("type") == "map":
-                    _render_map(map_data)
-                else:
-                    print("  Map not available.")
-            elif state:
-                ctx = state.get("context", {})
-                print(f"  {c(n(ctx.get('act_name','?')), 'bold')} Floor {ctx.get('floor','?')}")
-            continue
-        if raw == "quit":
-            print(t("Quitting...","退出..."))
-            sys.exit(0)
-
         if valid_options and raw not in valid_options:
             print(f"  {t('Invalid. Options:','无效。选项:')} {', '.join(sorted(valid_options))}")
             continue
@@ -983,7 +1036,7 @@ def get_input(prompt, valid_options=None, state=None):
 
 # ─── Main game loop ───
 
-def play(character="Ironclad", seed=None, auto=False):
+def play(character="Ironclad", seed=None, auto=False, ascension=0):
     proc = subprocess.Popen(
         [DOTNET, "run", "--no-build", "--project", PROJECT],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1013,10 +1066,11 @@ def play(character="Ironclad", seed=None, auto=False):
             return
 
         print(f"\n{c('Slay the Spire 2 — Headless CLI', 'bold')}")
-        print(f"{t('Character','角色')}: {character}  {t('Seed','种子')}: {seed or t('random','随机')}")
+        asc_str = f"  {t('Ascension','进阶')}: {ascension}" if ascension > 0 else ""
+        print(f"{t('Character','角色')}: {character}  {t('Seed','种子')}: {seed or t('random','随机')}{asc_str}")
         print(f"{t('Type','输入')} {c('help', 'cyan')} {t('for available commands.','查看可用命令。')}\n")
 
-        state = send({"cmd": "start_run", "character": character, "seed": seed or f"cli_{random.randint(1000,9999)}"})
+        state = send({"cmd": "start_run", "character": character, "ascension": ascension, "seed": seed or f"cli_{random.randint(1000,9999)}"})
 
         while True:
             if not state:
@@ -1057,7 +1111,7 @@ def play(character="Ironclad", seed=None, auto=False):
                         else:
                             pick = choices[0]
                 else:
-                    valid = {str(i): ch for i, ch in enumerate(choices)}
+                    valid = {str(i): ch for i, ch in enumerate(choices, 1)}
                     key = get_input(t("Choose path [number]", "选择路径 [编号]"), set(valid.keys()), state=state)
                     pick = valid[key]
 
@@ -1073,37 +1127,38 @@ def play(character="Ironclad", seed=None, auto=False):
                 valid = {"e": "end_turn"}
                 for card in hand:
                     if card.get("can_play") and card.get("cost", 99) <= energy:
-                        valid[str(card["index"])] = card
+                        valid[str(card["index"]+1)] = card
                 # Add potion shortcuts
                 for pot in state.get("player", {}).get("potions", []):
                     if pot:
-                        valid[f"p{pot['index']}"] = f"potion_{pot['index']}"
+                        valid[f"p{pot['index']+1}"] = pot
 
                 if auto:
                     # Auto: play first playable card, or end turn
                     playable = [c for c in hand if c.get("can_play") and c.get("cost", 99) <= energy]
                     if playable:
                         card = playable[0]
-                        choice = str(card["index"])
+                        choice = str(card["index"]+1)
                     else:
                         choice = "e"
                 else:
-                    choice = get_input(t("Play card [index], (e)nd turn, (p0) potion", "出牌 [编号], (e)结束回合, (p0)药水"), set(valid.keys()) | {"help"}, state=state)
+                    choice = get_input(t("Play card [index], (e)nd turn, (p1) potion", "出牌 [编号], (e)结束回合, (p1)药水"), set(valid.keys()) | {"help"}, state=state)
                     if choice == "help":
-                        print(f"  {t('Enter card index, e=end turn, p0=use potion 0', '输入卡牌编号，e=结束回合，p0=使用药水0')}")
+                        print(f"  {t('Enter card index, e=end turn, p1=use potion 1', '输入卡牌编号，e=结束回合，p1=使用药水1')}")
                         continue
 
                 if choice == "e":
                     state = send({"cmd": "action", "action": "end_turn"})
                 elif choice.startswith("p") and choice[1:].isdigit():
-                    # Use potion
-                    pidx = int(choice[1:])
-                    args = {"potion_index": pidx}
+                    # Use potion — user typed 1-based, look up the potion object for engine index
+                    pot = valid[choice]
+                    args = {"potion_index": pot["index"]}
                     # Ask for target if needed
                     if enemies:
-                        tgt = get_input("Target enemy [index] or self (s)", state=state)
+                        tgt = get_input(t("Target enemy [index] or self (s)", "目标敌人 [编号] 或 自身 (s)"),
+                                        {str(e["index"]+1) for e in enemies} | {"s"}, state=state)
                         if tgt != "s" and tgt.isdigit():
-                            args["target_index"] = int(tgt)
+                            args["target_index"] = int(tgt) - 1
                     state = send({"cmd": "action", "action": "use_potion", "args": args})
                 else:
                     card = valid[choice]
@@ -1114,19 +1169,19 @@ def play(character="Ironclad", seed=None, auto=False):
                         elif auto:
                             args["target_index"] = min(enemies, key=lambda e: e.get("hp", 999))["index"]
                         else:
-                            tgt = get_input("Target enemy [index]",
-                                           {str(e["index"]) for e in enemies})
-                            args["target_index"] = int(tgt)
+                            tgt = get_input(t("Target enemy [index]", "目标敌人 [编号]"),
+                                           {str(e["index"]+1) for e in enemies})
+                            args["target_index"] = int(tgt) - 1
                     state = send({"cmd": "action", "action": "play_card", "args": args})
 
             elif dec == "card_reward":
                 show_card_reward(state)
                 cards = state.get("cards", [])
-                valid = {str(c["index"]): c for c in cards}
+                valid = {str(c["index"]+1): c for c in cards}
                 valid["s"] = None  # skip
 
                 if auto:
-                    choice = "0" if cards else "s"
+                    choice = str(cards[0]["index"]+1) if cards else "s"
                 else:
                     choice = get_input(t("Pick card [index] or (s)kip", "选择卡牌 [编号] 或 (s)跳过"), set(valid.keys()), state=state)
 
@@ -1134,7 +1189,7 @@ def play(character="Ironclad", seed=None, auto=False):
                     state = send({"cmd": "action", "action": "skip_card_reward"})
                 else:
                     state = send({"cmd": "action", "action": "select_card_reward",
-                                 "args": {"card_index": int(choice)}})
+                                 "args": {"card_index": valid[choice]["index"]}})
 
             elif dec == "bundle_select":
                 print(f"\n{'─' * 60}")
@@ -1146,20 +1201,20 @@ def play(character="Ironclad", seed=None, auto=False):
                 print()
                 bundles = state.get("bundles", [])
                 for b in bundles:
-                    bidx = b["index"]
+                    bidx = b["index"] + 1
                     print(f"  {c(f'Pack [{bidx}]:', 'yellow')}")
                     for cd in b.get("cards", []):
                         cd_desc = card_desc(cd)
                         print(f"    {n(cd['name'])} ({cd.get('cost','?')}) {c(cd.get('type',''), 'dim')}")
                         if cd_desc:
                             print(f"      {c(cd_desc, 'dim')}")
-                valid = {str(b["index"]): b for b in bundles}
+                valid = {str(b["index"]+1): b for b in bundles}
                 if auto:
-                    choice = "0"
+                    choice = str(bundles[0]["index"]+1) if bundles else "1"
                 else:
                     choice = get_input(t("Choose pack [index]", "选择卡牌包 [编号]"), set(valid.keys()), state=state)
                 state = send({"cmd": "action", "action": "select_bundle",
-                             "args": {"bundle_index": int(choice)}})
+                             "args": {"bundle_index": valid[choice]["index"]}})
 
             elif dec == "card_select":
                 print(f"\n{'─' * 60}")
@@ -1178,28 +1233,59 @@ def play(character="Ironclad", seed=None, auto=False):
                     ctype_zh = CARD_TYPE_ZH.get(cd.get("type", ""), cd.get("type", ""))
                     ctype_label = t(cd.get("type", ""), ctype_zh)
                     cd_desc_text = card_desc(cd)
-                    print(f"  [{cd['index']}] {n(cd['name'])}{up} ({cd.get('cost','?')}) {c(ctype_label, 'dim')}")
+                    print(f"  [{cd['index']+1}] {n(cd['name'])}{up} ({cd.get('cost','?')}) {c(ctype_label, 'dim')}")
                     if cd_desc_text:
                         print(f"      {c(cd_desc_text, 'dim')}")
                     aug_parts = _format_upgrade_preview(stats, cd.get("after_upgrade"), cd.get("cost"))
                     if aug_parts:
                         print(f"      {c(t('upgrade:','升级:'), 'green')} {', '.join(aug_parts)}")
 
-                valid = {str(cd["index"]): cd for cd in cards}
-                if min_sel == 0:
-                    valid["s"] = None
+                valid = {str(cd["index"]+1): cd for cd in cards}
 
                 if auto:
-                    choice = "0"
+                    choice_tokens = [str(cards[0]["index"]+1)] if cards else []
+                    skip = not choice_tokens
                 else:
-                    choice = get_input(t("Choose card(s) [index] or (s)kip", "选择卡牌 [编号] 或 (s)跳过"), set(valid.keys()), state=state)
+                    skip = False
+                    choice_tokens = []
+                    can_skip = min_sel == 0
+                    skip_hint = " or (s)kip" if can_skip else ""
+                    skip_hint_zh = "，或 (s) 跳过" if can_skip else ""
+                    prompt_str = t(
+                        f"Choose {min_sel}-{max_sel} card(s) [index], comma/space separated{skip_hint}",
+                        f"选择 {min_sel}-{max_sel} 张卡牌 [编号]，逗号或空格分隔{skip_hint_zh}"
+                    )
+                    while True:
+                        try:
+                            raw = input(f"\n{c('>', 'green')} {prompt_str}: ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            print(f"\n{t('Quitting...','退出...')}")
+                            sys.exit(0)
+                        if not raw:
+                            continue
+                        if _handle_meta(raw, state):
+                            continue
+                        if can_skip and raw == "s":
+                            skip = True
+                            break
+                        tokens = [tok for tok in re.split(r'[,\s]+', raw) if tok]
+                        invalid = [tok for tok in tokens if tok not in valid]
+                        if invalid:
+                            print(f"  {t('Invalid indices:','无效编号:')} {', '.join(invalid)}. "
+                                  f"{t('Valid:','可选:')} {', '.join(sorted(valid.keys()))}")
+                            continue
+                        if len(tokens) < min_sel or len(tokens) > max_sel:
+                            print(f"  {t(f'Select {min_sel}-{max_sel} cards (got {len(tokens)}).', f'需要选 {min_sel}-{max_sel} 张（已选 {len(tokens)} 张）。')}")
+                            continue
+                        choice_tokens = tokens
+                        break
 
-                if choice == "s":
+                if skip:
                     state = send({"cmd": "action", "action": "skip_select"})
                 else:
-                    # Support comma-separated indices
+                    engine_indices = ",".join(str(valid[tok]["index"]) for tok in choice_tokens)
                     state = send({"cmd": "action", "action": "select_cards",
-                                 "args": {"indices": choice}})
+                                 "args": {"indices": engine_indices}})
 
             elif dec == "shop":
                 show_shop(state)
@@ -1207,7 +1293,7 @@ def play(character="Ironclad", seed=None, auto=False):
                 if auto:
                     choice = "leave"
                 else:
-                    choice = get_input(t("Buy [index/r0/p0/rm] or (leave)", "购买 [编号/r0/p0/rm] 或 (leave)离开"), state=state)
+                    choice = get_input(t("Buy [index/r1/p1/rm] or (leave)", "购买 [编号/r1/p1/rm] 或 (leave)离开"), state=state)
 
                 if choice == "leave":
                     state = send({"cmd": "action", "action": "leave_room"})
@@ -1215,19 +1301,19 @@ def play(character="Ironclad", seed=None, auto=False):
                     state = send({"cmd": "action", "action": "remove_card"})
                 elif choice.startswith("r"):
                     state = send({"cmd": "action", "action": "buy_relic",
-                                 "args": {"relic_index": int(choice[1:])}})
+                                 "args": {"relic_index": int(choice[1:]) - 1}})
                 elif choice.startswith("p"):
                     state = send({"cmd": "action", "action": "buy_potion",
-                                 "args": {"potion_index": int(choice[1:])}})
+                                 "args": {"potion_index": int(choice[1:]) - 1}})
                 else:
                     state = send({"cmd": "action", "action": "buy_card",
-                                 "args": {"card_index": int(choice)}})
+                                 "args": {"card_index": int(choice) - 1}})
 
             elif dec == "rest_site":
                 show_rest_site(state)
                 options = state.get("options", [])
                 enabled = [o for o in options if o.get("is_enabled")]
-                valid = {str(o["index"]): o for o in enabled}
+                valid = {str(o["index"]+1): o for o in enabled}
 
                 if auto:
                     hp = state.get("player", {}).get("hp", 1)
@@ -1235,12 +1321,12 @@ def play(character="Ironclad", seed=None, auto=False):
                     heal = next((o for o in enabled if o.get("option_id") == "HEAL"), None)
                     smith = next((o for o in enabled if o.get("option_id") == "SMITH"), None)
                     pick = (heal if hp < mhp * 0.7 else smith) or (heal or (enabled[0] if enabled else None))
-                    choice = str(pick["index"]) if pick else "0"
+                    choice = str(pick["index"]+1) if pick else "1"
                 else:
                     choice = get_input(t("Choose option [index]", "选择 [编号]"), set(valid.keys()), state=state)
 
                 state = send({"cmd": "action", "action": "choose_option",
-                             "args": {"option_index": int(choice)}})
+                             "args": {"option_index": valid[choice]["index"]}})
                 if state and state.get("type") == "error":
                     state = send({"cmd": "action", "action": "leave_room"})
 
@@ -1248,7 +1334,7 @@ def play(character="Ironclad", seed=None, auto=False):
                 show_event(state)
                 options = state.get("options", [])
                 unlocked = [o for o in options if not o.get("is_locked")]
-                valid = {str(o["index"]): o for o in unlocked}
+                valid = {str(o["index"]+1): o for o in unlocked}
                 valid["leave"] = None
 
                 # Save state before choice to show diff
@@ -1260,7 +1346,7 @@ def play(character="Ironclad", seed=None, auto=False):
                 old_gold = state.get("player",{}).get("gold", 0)
 
                 if auto:
-                    choice = str(unlocked[0]["index"]) if unlocked else "leave"
+                    choice = str(unlocked[0]["index"]+1) if unlocked else "leave"
                 else:
                     choice = get_input(t("Choose option [index] or (leave)", "选择 [编号] 或 (leave)离开"), set(valid.keys()), state=state)
 
@@ -1268,7 +1354,7 @@ def play(character="Ironclad", seed=None, auto=False):
                     state = send({"cmd": "action", "action": "leave_room"})
                 else:
                     state = send({"cmd": "action", "action": "choose_option",
-                                 "args": {"option_index": int(choice)}})
+                                 "args": {"option_index": valid[choice]["index"]}})
                     if state and state.get("type") == "error":
                         state = send({"cmd": "action", "action": "leave_room"})
 
@@ -1325,20 +1411,66 @@ def play(character="Ironclad", seed=None, auto=False):
             proc.kill()
 
 
+_CHARACTER_ALIASES = {
+    "i": "Ironclad", "ironclad": "Ironclad",
+    "s": "Silent",   "silent": "Silent",
+    "d": "Defect",   "defect": "Defect",
+    "r": "Regent",   "regent": "Regent",
+    "n": "Necrobinder", "necrobinder": "Necrobinder",
+}
+
+def _resolve_character(value):
+    resolved = _CHARACTER_ALIASES.get(value.lower())
+    if resolved is None:
+        valid = "Ironclad (i), Silent (s), Defect (d), Regent (r), Necrobinder (n)"
+        raise argparse.ArgumentTypeError(
+            f"Unknown character '{value}'. Valid choices: {valid}. "
+            f"For ascension use -a (e.g. sts2 d -a 10) or combined form (e.g. sts2 d10)"
+        )
+    return resolved
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Play Slay the Spire 2 in your terminal")
+    parser.add_argument("positional", nargs="*", metavar="ARG",
+                       help="Optional: [character] [ascension] e.g. 'd 4' for Defect Ascension 4")
     parser.add_argument("--auto", action="store_true", help="Auto-play with simple AI")
     parser.add_argument("--seed", type=str, default=None, help="Random seed")
-    parser.add_argument("--character", type=str, default="Ironclad",
-                       choices=["Ironclad", "Silent", "Defect", "Regent", "Necrobinder"],
-                       help="Character to play")
+    parser.add_argument("-c", "--character", type=_resolve_character, default=None,
+                       metavar="CHAR",
+                       help="Character: Ironclad (i), Silent (s), Defect (d), Regent (r), Necrobinder (n)")
+    parser.add_argument("-a", "--ascension", type=int, default=None,
+                       metavar="LEVEL",
+                       help="Ascension level (0-20)")
     parser.add_argument("--lang", type=str, default="both",
                        choices=["en", "zh", "both"],
                        help="Display language: en, zh, or both")
     args = parser.parse_args()
 
+    # Apply positional args (character and/or ascension) if not set via flags
+    for pos in args.positional:
+        if pos.isdigit():
+            if args.ascension is None:
+                args.ascension = int(pos)
+        else:
+            # Support combined form like "d10" (character + ascension)
+            m = re.match(r'^([a-z]+)(\d+)$', pos)
+            if m and args.character is None and args.ascension is None:
+                try:
+                    args.character = _resolve_character(m.group(1))
+                    args.ascension = int(m.group(2))
+                except argparse.ArgumentTypeError as e:
+                    parser.error(str(e))
+            elif args.character is None:
+                try:
+                    args.character = _resolve_character(pos)
+                except argparse.ArgumentTypeError as e:
+                    parser.error(str(e))
+
+    args.character = args.character or "Ironclad"
+    args.ascension = args.ascension or 0
+
     import play as _self
     _self.LANG = args.lang
 
     ensure_setup()
-    play(character=args.character, seed=args.seed, auto=args.auto)
+    play(character=args.character, seed=args.seed, auto=args.auto, ascension=args.ascension)
