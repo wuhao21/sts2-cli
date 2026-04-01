@@ -11,7 +11,7 @@
   "LEVEL_04.title": "收紧腰带",
   "LEVEL_05.description": "游戏开始时被[red]诅咒[/red]。",
   "LEVEL_05.title": "进阶之灾",
-  "LEVEL_06.description": "休息处和？房间变少。",
+  "LEVEL_06.description": "休息处变少。",
   "LEVEL_06.title": "阴郁",
   "LEVEL_07.description": "稀有和已升级卡牌更少出现。",
   "LEVEL_07.title": "稀缺",
@@ -22,6 +22,5 @@
   "LEVEL_10.description": "在第3幕末尾与两名首领战斗。",
   "LEVEL_10.title": "双重Boss",
   "PORTRAIT_DESCRIPTION": "{ascensions:list: +{}|\n}",
-  "PORTRAIT_TITLE": "{character} - 进阶{ascension}",
-  "PORTRAIT_TITLE_NO_ASCENSION": "{character}"
+  "PORTRAIT_TITLE": "{character} - 进阶{ascension}"
 }

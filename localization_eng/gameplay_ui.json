@@ -1,5 +1,4 @@
 {
-  "ACHIEVEMENTS_LOCKED": "[red]Achievements & Epochs are locked for this run.[/red]",
   "ACT_NUMBER": "Act {actNumber}",
   "ASCENSION_LEVEL": "Ascension {ascension}",
   "BATTLE_START": "Battle Start",
@@ -98,7 +97,6 @@
   "TO_INSPECT_PROMPT": "To Inspect",
   "TREASURE_BANNER": "What's Inside?",
   "TREASURE_EMPTY": "Empty",
-  "TREASURE_FIGHT_TEXT": "Fight!!!",
   "TURN_COUNT": "Turn {turnNumber}",
   "UNDO_END_TURN_BUTTON": "Cancel",
   "VIEW_UPGRADES": "View Upgrades"

@@ -45,7 +45,7 @@
   "ESSENCE_OF_DARKNESS.title": "Essence of Darkness",
   "EXPLOSIVE_AMPOULE.description": "Deal [blue]{Damage}[/blue] damage to ALL enemies.",
   "EXPLOSIVE_AMPOULE.title": "Explosive Ampoule",
-  "FAIRY_IN_A_BOTTLE.description": "When your HP would be reduced to [blue]0[/blue], instead this potion is discarded and you heal to [blue]30%[/blue] of your Max HP.",
+  "FAIRY_IN_A_BOTTLE.description": "When you would die, instead this potion is discarded and you heal to [blue]30%[/blue] of your Max HP.",
   "FAIRY_IN_A_BOTTLE.title": "Fairy in a Bottle",
   "FIRE_POTION.description": "Deal [blue]{Damage}[/blue] damage.",
   "FIRE_POTION.title": "Fire Potion",

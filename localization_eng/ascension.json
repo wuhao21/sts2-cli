@@ -11,7 +11,7 @@
   "LEVEL_04.title": "Tight Belt",
   "LEVEL_05.description": "Start each run [red]Cursed[/red].",
   "LEVEL_05.title": "Ascender's Bane",
-  "LEVEL_06.description": "Less Rest Sites and ? rooms.",
+  "LEVEL_06.description": "Less Rest Sites.",
   "LEVEL_06.title": "Gloom",
   "LEVEL_07.description": "Rare and Upgraded cards appear less often.",
   "LEVEL_07.title": "Scarcity",
@@ -22,6 +22,5 @@
   "LEVEL_10.description": "Fight two bosses at the end of Act 3.",
   "LEVEL_10.title": "Double Boss",
   "PORTRAIT_DESCRIPTION": "{ascensions:list: +{}|\n}",
-  "PORTRAIT_TITLE": "{character} - Ascension {ascension}",
-  "PORTRAIT_TITLE_NO_ASCENSION": "{character}"
+  "PORTRAIT_TITLE": "{character} - Ascension {ascension}"
 }

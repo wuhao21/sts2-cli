@@ -45,6 +45,6 @@
   "PLAYER_COUNT.singleplayer": "单人游戏",
   "PLAYER_HOVER": "[blue]{PlayerName}[/blue]\n[gold]{CharacterName}[/gold]",
   "PLAYER_NAME": "[blue]{PlayerName}[/blue]",
-  "RELIC_HISTORY.categories": "{ShopRelics:cond:>0?{}商店，|} {AncientRelics:cond:>0?{}先古，|}{EventRelics:cond:>0?{}事件，|}{RareRelics:cond:>0?{}稀有，|}{UncommonRelics:cond:>0?{}罕见，|}{CommonRelics:cond:>0?{}普通，|}{StarterRelics:cond:>0?{}初始|}",
+  "RELIC_HISTORY.categories": "{ShopRelics:cond:>0?{}商店，|} {AncientRelics:cond:>0?{}先古|}{EventRelics:cond:>0?{}事件，|}{RareRelics:cond:>0?{}稀有，|}{UncommonRelics:cond:>0?{}罕见，|}{CommonRelics:cond:>0?{}普通，|}{StarterRelics:cond:>0?{}初始|}",
   "RELIC_HISTORY.header": "遗物（{totalRelics}）："
 }
