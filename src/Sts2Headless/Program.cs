@@ -28,9 +28,15 @@ class Program
         };
 
         // Set up assembly resolution to find game DLLs
-        var libDir = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "lib");
+        // AppContext.BaseDirectory = src/Sts2Headless/bin/Debug/net9.0/
+        // Need 5 levels up to reach project root where lib/ lives
+        var libDir = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "lib");
         if (!Directory.Exists(libDir))
-            libDir = Path.Combine(AppContext.BaseDirectory, "lib");
+        {
+            libDir = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "lib");
+            if (!Directory.Exists(libDir))
+                libDir = Path.Combine(AppContext.BaseDirectory, "lib");
+        }
 
         AssemblyLoadContext.Default.Resolving += (ctx, name) =>
         {
