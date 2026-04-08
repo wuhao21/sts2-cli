@@ -12,3 +12,4 @@ obj/
 .DS_Store
 .obsidian/
 logs/
+.godot-user/

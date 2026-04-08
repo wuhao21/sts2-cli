@@ -27,6 +27,8 @@ using MegaCrit.Sts2.Core.Localization;
 using MegaCrit.Sts2.Core.Multiplayer.Serialization;
 using MegaCrit.Sts2.Core.Saves;
 using MegaCrit.Sts2.Core.Unlocks;
+using MegaCrit.Sts2.Core.DevConsole;
+using MegaCrit.Sts2.Core.DevConsole.ConsoleCommands;
 
 namespace Sts2Headless;
 
@@ -207,6 +209,7 @@ public class RunSimulator
     // Pending bundle selection (Scroll Boxes: pick 1 of N packs)
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
     private TaskCompletionSource<IEnumerable<CardModel>>? _pendingBundleTcs;
+    private DevConsole? _devConsole;
 
     public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en")
     {
@@ -248,6 +251,7 @@ public class RunSimulator
             // Register event handlers for combat turn transitions
             CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
             CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
+            _devConsole = null;
 
             // Finalize starting relics
             RunManager.Instance.FinalizeStartingRelics().GetAwaiter().GetResult();
@@ -461,6 +465,119 @@ public class RunSimulator
         catch (Exception ex) { return ErrorWithTrace("SetDrawOrder failed", ex); }
     }
 
+    public Dictionary<string, object?> ExecuteConsoleCommand(string? input)
+    {
+        try
+        {
+            if (_runState == null) return Error("No run in progress");
+            if (string.IsNullOrWhiteSpace(input)) return Error("Provide 'input' for console command");
+
+            SynchronizationContext.SetSynchronizationContext(_syncCtx);
+
+            var stdOut = Console.Out;
+            var stdErr = Console.Error;
+            using var capturedOut = new StringWriter();
+            using var capturedErr = new StringWriter();
+
+            try
+            {
+                Console.SetOut(capturedOut);
+                Console.SetError(capturedErr);
+
+                _devConsole ??= new DevConsole(true);
+                var cmdResult = _devConsole.ProcessCommand(input);
+
+                _syncCtx.Pump();
+                WaitForActionExecutor();
+
+                var output = CombineConsoleOutput(capturedOut.ToString(), capturedErr.ToString());
+                var errorMessage = TryGetConsoleFailure(output);
+                if (!string.IsNullOrEmpty(errorMessage))
+                {
+                    var err = Error($"Console command failed: {errorMessage}");
+                    err["input"] = input;
+                    err["output"] = output;
+                    return err;
+                }
+
+                var result = new Dictionary<string, object?>
+                {
+                    ["type"] = "console_result",
+                    ["input"] = input,
+                    ["console"] = SerializeConsoleResult(cmdResult),
+                    ["state"] = DetectDecisionPoint(),
+                };
+
+                if (!string.IsNullOrWhiteSpace(output))
+                    result["output"] = output;
+
+                return result;
+            }
+            finally
+            {
+                Console.SetOut(stdOut);
+                Console.SetError(stdErr);
+            }
+        }
+        catch (Exception ex)
+        {
+            return ErrorWithTrace("ExecuteConsoleCommand failed", ex);
+        }
+    }
+
+    public Dictionary<string, object?> DumpConsoleCommands()
+    {
+        try
+        {
+            EnsureModelDbInitialized();
+
+            var commands = new List<Dictionary<string, object?>>();
+            foreach (var type in AbstractConsoleCmdSubtypes.All.OrderBy(t => t.FullName, StringComparer.Ordinal))
+            {
+                var entry = new Dictionary<string, object?>
+                {
+                    ["class_name"] = type.Name,
+                    ["type_name"] = type.FullName,
+                };
+
+                try
+                {
+                    var instance = Activator.CreateInstance(type) as AbstractConsoleCmd;
+                    if (instance == null)
+                    {
+                        entry["instantiate_error"] = "Activator returned null";
+                    }
+                    else
+                    {
+                        entry["cmd_name"] = instance.CmdName;
+                        entry["args"] = string.IsNullOrWhiteSpace(instance.Args) ? null : instance.Args;
+                        entry["description"] = string.IsNullOrWhiteSpace(instance.Description) ? null : instance.Description;
+                        entry["debug_only"] = instance.DebugOnly;
+                        entry["is_networked"] = instance.IsNetworked;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    var inner = ex.InnerException ?? ex;
+                    entry["instantiate_error"] = $"{inner.GetType().Name}: {inner.Message}";
+                }
+
+                commands.Add(entry);
+            }
+
+            return new Dictionary<string, object?>
+            {
+                ["type"] = "console_commands",
+                ["count"] = AbstractConsoleCmdSubtypes.Count,
+                ["commands"] = commands,
+            };
+        }
+        catch (Exception ex)
+        {
+            return ErrorWithTrace("DumpConsoleCommands failed", ex);
+        }
+    }
+
     // ─── Game actions ───
     public Dictionary<string, object?> LoadSave(string saveJson)
     {
@@ -492,6 +609,7 @@ public class RunSimulator
 
             CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
             CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
+            _devConsole = null;
             CardSelectCmd.UseSelector(_cardSelector);
             LocPatches._bundleSimRef = this;
 
@@ -3423,11 +3541,124 @@ public class RunSimulator
             if (RunManager.Instance.IsInProgress)
                 RunManager.Instance.CleanUp(graceful: true);
             _runState = null;
+            _devConsole = null;
         }
         catch (Exception ex)
         {
             Log($"CleanUp exception: {ex.Message}");
         }
+    }
+
+    private static Dictionary<string, object?> SerializeConsoleResult(CmdResult cmdResult)
+    {
+        var result = new Dictionary<string, object?>
+        {
+            ["result_type"] = cmdResult.GetType().FullName,
+            ["to_string"] = cmdResult.ToString(),
+        };
+
+        foreach (var prop in cmdResult.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+        {
+            try
+            {
+                result[prop.Name] = MakeJsonFriendly(prop.GetValue(cmdResult));
+            }
+            catch (Exception ex)
+            {
+                result[prop.Name] = $"<error: {ex.GetType().Name}: {ex.Message}>";
+            }
+        }
+
+        foreach (var field in cmdResult.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance))
+        {
+            if (result.ContainsKey(field.Name)) continue;
+            try
+            {
+                result[field.Name] = MakeJsonFriendly(field.GetValue(cmdResult));
+            }
+            catch (Exception ex)
+            {
+                result[field.Name] = $"<error: {ex.GetType().Name}: {ex.Message}>";
+            }
+        }
+
+        return result;
+    }
+
+    private static string CombineConsoleOutput(string stdOut, string stdErr)
+    {
+        var parts = new List<string>();
+
+        static string Normalize(string text)
+        {
+            return text.Replace("\r\n", "\n").Trim();
+        }
+
+        var outText = Normalize(stdOut);
+        if (!string.IsNullOrWhiteSpace(outText))
+            parts.Add(outText);
+
+        var errText = Normalize(stdErr);
+        if (!string.IsNullOrWhiteSpace(errText))
+            parts.Add(errText);
+
+        return string.Join(Environment.NewLine, parts);
+    }
+
+    private static string? TryGetConsoleFailure(string output)
+    {
+        if (string.IsNullOrWhiteSpace(output))
+            return null;
+
+        foreach (var rawLine in output.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var line = rawLine.Trim();
+            if (string.IsNullOrEmpty(line))
+                continue;
+
+            var isErrorLine =
+                line.StartsWith("[ERROR]", StringComparison.OrdinalIgnoreCase) ||
+                line.Contains("Exception:", StringComparison.Ordinal);
+
+            if (!isErrorLine)
+                continue;
+
+            while (line.StartsWith("[ERROR]", StringComparison.OrdinalIgnoreCase))
+                line = line.Substring("[ERROR]".Length).TrimStart();
+
+            return line;
+        }
+
+        return null;
+    }
+
+    private static object? MakeJsonFriendly(object? value)
+    {
+        if (value == null) return null;
+
+        var type = value.GetType();
+        if (type.IsPrimitive || value is string || value is decimal)
+            return value;
+        if (value is Enum)
+            return value.ToString();
+        if (value is IEnumerable<string> strings)
+            return strings.ToList();
+        if (value is System.Collections.IEnumerable seq && value is not string)
+        {
+            var items = new List<object?>();
+            foreach (var item in seq)
+            {
+                items.Add(MakeJsonFriendly(item));
+                if (items.Count >= 32)
+                {
+                    items.Add("...");
+                    break;
+                }
+            }
+            return items;
+        }
+
+        return value.ToString();
     }
 
     #endregion

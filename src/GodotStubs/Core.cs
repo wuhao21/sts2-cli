@@ -157,20 +157,29 @@ public static class GD
 public static class OS
 {
     public static void ShellOpen(string uri) { }
+    public static Error ShellShowInFileManager(string path, bool openFolder = false) => Error.Unavailable;
     public static string GetLocale() => "en";
     public static string GetName() => "headless";
     public static string GetVersion() => "0.0";
     public static string GetExecutablePath() => "";
     public static bool HasFeature(string feature) => false;
     public static bool IsDebugBuild() => false;
-    public static string GetDataDir() => ".";
-    public static string GetUserDataDir() => ".";
+    public static string GetDataDir() => ProjectSettings.GlobalizePath("user://");
+    public static string GetUserDataDir() => ProjectSettings.GlobalizePath("user://");
     public static string[] GetCmdlineArgs() => Array.Empty<string>();
 }
 
 public static class ProjectSettings
 {
-    public static string GlobalizePath(string path) => path;
+    public static string GlobalizePath(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return path;
+        if (path.StartsWith("user://", StringComparison.OrdinalIgnoreCase))
+            return Path.Combine(Environment.CurrentDirectory, ".godot-user", path.Substring("user://".Length).Replace('/', Path.DirectorySeparatorChar));
+        if (path.StartsWith("res://", StringComparison.OrdinalIgnoreCase))
+            return Path.Combine(Environment.CurrentDirectory, path.Substring("res://".Length).Replace('/', Path.DirectorySeparatorChar));
+        return path;
+    }
     public static Variant GetSetting(string name, Variant @default = default) => @default;
     public static bool LoadResourcePack(string path) => false;
 }

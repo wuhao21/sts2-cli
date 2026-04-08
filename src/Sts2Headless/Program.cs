@@ -169,6 +169,15 @@ class Program
                 return sim.SaveCheckpoint(outputPath);
             }
 
+            case "console":
+            {
+                var input = cmd.TryGetProperty("input", out var inputElem) ? inputElem.GetString() : null;
+                return sim.ExecuteConsoleCommand(input);
+            }
+
+            case "dump_console_commands":
+                return sim.DumpConsoleCommands();
+
             case "quit":
             {
                 var outputPath = cmd.TryGetProperty("path", out var op) ? op.GetString() : null;

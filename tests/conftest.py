@@ -67,6 +67,9 @@ class Game:
     def set_draw_order(self, cards):
         return self.send({"cmd": "set_draw_order", "cards": cards})
 
+    def console(self, input_text):
+        return self.send({"cmd": "console", "input": input_text})
+
     def close(self):
         try:
             self.proc.stdin.write('{"cmd":"quit"}\n')

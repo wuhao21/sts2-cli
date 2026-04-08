@@ -336,12 +336,108 @@ public class InputEventMouseMotion : InputEvent
 public class FileAccess : GodotObject, IDisposable
 {
     public enum ModeFlags { Read, Write, ReadWrite, WriteRead }
-    public static FileAccess? Open(string path, ModeFlags flags) => null;
-    public static bool FileExists(string path) => File.Exists(path);
-    public string GetAsText(bool skipCr = false) => "";
-    public void StoreString(string str) { }
-    public void Close() { }
-    public void Dispose() { }
+    private FileStream? _stream;
+    private StreamReader? _reader;
+    private StreamWriter? _writer;
+
+    private FileAccess(FileStream stream)
+    {
+        _stream = stream;
+    }
+
+    private static string ResolvePath(string path) => ProjectSettings.GlobalizePath(path);
+
+    public static FileAccess? Open(string path, ModeFlags flags)
+    {
+        try
+        {
+            var resolved = ResolvePath(path);
+            var dir = Path.GetDirectoryName(resolved);
+            if (!string.IsNullOrEmpty(dir) && flags != ModeFlags.Read)
+                Directory.CreateDirectory(dir);
+
+            var mode = flags switch
+            {
+                ModeFlags.Read => FileMode.Open,
+                ModeFlags.Write => FileMode.Create,
+                ModeFlags.ReadWrite => FileMode.OpenOrCreate,
+                ModeFlags.WriteRead => FileMode.Create,
+                _ => FileMode.OpenOrCreate,
+            };
+
+            var access = flags switch
+            {
+                ModeFlags.Read => System.IO.FileAccess.Read,
+                ModeFlags.Write => System.IO.FileAccess.Write,
+                ModeFlags.ReadWrite => System.IO.FileAccess.ReadWrite,
+                ModeFlags.WriteRead => System.IO.FileAccess.ReadWrite,
+                _ => System.IO.FileAccess.ReadWrite,
+            };
+
+            return new FileAccess(new FileStream(resolved, mode, access, FileShare.ReadWrite));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static bool FileExists(string path) => File.Exists(ResolvePath(path));
+
+    public ulong GetPosition() => (ulong)(_stream?.Position ?? 0);
+
+    public ulong GetLength() => (ulong)(_stream?.Length ?? 0);
+
+    public void Seek(ulong position)
+    {
+        if (_stream == null) return;
+        _stream.Position = (long)position;
+        _reader?.DiscardBufferedData();
+    }
+
+    public bool EofReached() => _stream == null || _stream.Position >= _stream.Length;
+
+    public string GetAsText(bool skipCr = false)
+    {
+        if (_stream == null || !_stream.CanRead) return "";
+        _reader ??= new StreamReader(_stream, System.Text.Encoding.UTF8, true, 1024, leaveOpen: true);
+        var text = _reader.ReadToEnd();
+        return skipCr ? text.Replace("\r", "") : text;
+    }
+
+    public string GetLine()
+    {
+        if (_stream == null || !_stream.CanRead) return "";
+        _reader ??= new StreamReader(_stream, System.Text.Encoding.UTF8, true, 1024, leaveOpen: true);
+        return _reader.ReadLine() ?? "";
+    }
+
+    public void StoreString(string str)
+    {
+        if (_stream == null || !_stream.CanWrite) return;
+        _writer ??= new StreamWriter(_stream, System.Text.Encoding.UTF8, 1024, leaveOpen: true);
+        _writer.Write(str);
+        _writer.Flush();
+    }
+
+    public bool StoreLine(string line)
+    {
+        StoreString(line + Environment.NewLine);
+        return true;
+    }
+
+    public void Close()
+    {
+        _writer?.Flush();
+        _writer?.Dispose();
+        _writer = null;
+        _reader?.Dispose();
+        _reader = null;
+        _stream?.Dispose();
+        _stream = null;
+    }
+
+    public void Dispose() => Close();
 }
 
 // DirAccess

@@ -1064,16 +1064,68 @@ def _draw_conn(buf, from_col, to_col, W):
         if 0 <= mid < len(buf):
             buf[mid] = ch
 
+def _print_console_result(resp):
+    """Render a short summary of a bridged console command."""
+    if not resp:
+        print(f"  {c(t('No response from console bridge.','控制台桥接没有返回结果。'), 'red')}")
+        return
+    if resp.get("type") == "error":
+        print(f"  {c(t('Console error:','控制台错误:'), 'red')} {resp.get('message', '?')}")
+        output = resp.get("output")
+        if output:
+            for line in str(output).splitlines():
+                print(f"    {line}")
+        return
+
+    console = resp.get("console") or {}
+    output = resp.get("output")
+    pieces = []
+    for key in ("Message", "Text", "Status", "Success", "IsSuccess", "Error"):
+        value = console.get(key)
+        if value not in (None, "", []):
+            pieces.append(f"{key}={value}")
+
+    if not pieces:
+        for key, value in console.items():
+            if key in ("result_type", "to_string") or value in (None, "", []):
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                pieces.append(f"{key}={value}")
+            elif isinstance(value, list):
+                pieces.append(f"{key}=[{', '.join(str(v) for v in value[:5])}]")
+            if len(pieces) >= 4:
+                break
+
+    summary = " | ".join(pieces) if pieces else console.get("to_string", "ok")
+    if output:
+        header = f"  {c('[DevConsole]', 'yellow')}"
+        if pieces:
+            header += f" {summary}"
+        print(header)
+        for line in str(output).splitlines():
+            print(f"    {line}")
+        return
+
+    print(f"  {c('[DevConsole]', 'yellow')} {summary}")
+
+
+def _should_record_replay(cmd, record=True):
+    """Return True when a command should be persisted into replay saves."""
+    return bool(record and cmd.get("cmd") in {"action", "console"})
+
+
 def get_input(prompt, valid_options=None, state=None):
-    """Get user input with validation. Supports meta-commands: help, map, deck, potions."""
+    """Get user input with validation. Supports meta-commands like help/map/save/console."""
     while True:
         try:
-            raw = input(f"\n{c('>', 'green')} {prompt}: ").strip().lower()
+            raw_input = input(f"\n{c('>', 'green')} {prompt}: ").strip()
         except (EOFError, KeyboardInterrupt):
             raise _QuitRequested()
 
-        if not raw:
+        if not raw_input:
             continue
+
+        raw = raw_input.lower()
 
         # Meta-commands available at any prompt
         if raw == "help":
@@ -1088,6 +1140,7 @@ def get_input(prompt, valid_options=None, state=None):
     {c('quit', 'cyan')}     — 退出
     {c('save', 'cyan')}     — 存档
     {c('saves', 'cyan')}    — 查看存档列表
+    {c('console ...', 'cyan')} — 运行 console 命令
 
   {c('操作:', 'bold')}
     地图:    输入路径编号 (0, 1, 2)
@@ -1109,6 +1162,7 @@ def get_input(prompt, valid_options=None, state=None):
     {c('abandon', 'cyan')}  — abandon run (forfeit)
     {c('save', 'cyan')}     — save game
     {c('saves', 'cyan')}    — list saves
+    {c('console ...', 'cyan')} — run a console command
 
   {c('Actions:', 'bold')}
     Map:     path number (0, 1, 2)
@@ -1164,6 +1218,22 @@ def get_input(prompt, valid_options=None, state=None):
                 print(f"\n  {t('Load with:','读档命令:')} python3 play.py --load saves/{saves[0]['file']}")
             else:
                 print(f"  {t('No saves found.','没有找到存档。')}")
+            continue
+        if raw == "console" or raw == "dev":
+            print(f"  {t('Usage: console <command>','用法: console <命令>')}")
+            continue
+        if raw.startswith("console ") or raw.startswith("dev "):
+            if not hasattr(get_input, '_send'):
+                print(f"  {t('Console bridge unavailable.','控制台桥接不可用。')}")
+                continue
+            cmd_text = raw_input.split(None, 1)[1].strip()
+            resp = get_input._send({"cmd": "console", "input": cmd_text})
+            _print_console_result(resp)
+            new_state = resp.get("state") if isinstance(resp, dict) else None
+            if isinstance(state, dict) and isinstance(new_state, dict):
+                state.clear()
+                state.update(new_state)
+                return "__refresh__"
             continue
         if raw == "quit":
             raise _QuitRequested()
@@ -1297,7 +1367,7 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
 
     def send(cmd, record=True):
         logger.log_action(cmd)
-        if record and cmd.get("cmd") == "action":
+        if _should_record_replay(cmd, record):
             action_log.append(cmd)
         proc.stdin.write(json.dumps(cmd) + "\n")
         proc.stdin.flush()
@@ -1438,6 +1508,8 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                 else:
                     valid = {str(i): ch for i, ch in enumerate(choices)}
                     key = get_input(t("Choose path [number]", "选择路径 [编号]"), set(valid.keys()), state=state)
+                    if key == "__refresh__":
+                        continue
                     pick = valid[key]
 
                 state = send({"cmd": "action", "action": "select_map_node",
@@ -1468,6 +1540,8 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                         choice = "e"
                 else:
                     choice = get_input(t("Play card [index], (e)nd turn, (p0) potion", "出牌 [编号], (e)结束回合, (p0)药水"), set(valid.keys()) | {"help"}, state=state)
+                    if choice == "__refresh__":
+                        continue
                     if choice == "help":
                         print(f"  {t('Enter card index, e=end turn, p0=use potion 0', '输入卡牌编号，e=结束回合，p0=使用药水0')}")
                         continue
@@ -1493,6 +1567,8 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                     # Ask for target if needed
                     if enemies:
                         tgt = get_input("Target enemy [index] or self (s)", state=state)
+                        if tgt == "__refresh__":
+                            continue
                         if tgt != "s" and tgt.isdigit():
                             args["target_index"] = int(tgt)
                     state = send({"cmd": "action", "action": "use_potion", "args": args})
@@ -1507,6 +1583,8 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                         else:
                             tgt = get_input("Target enemy [index]",
                                            {str(e["index"]) for e in enemies})
+                            if tgt == "__refresh__":
+                                continue
                             args["target_index"] = int(tgt)
                     state = send({"cmd": "action", "action": "play_card", "args": args})
 
@@ -1520,6 +1598,8 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                     choice = "0" if cards else "s"
                 else:
                     choice = get_input(t("Pick card [index] or (s)kip", "选择卡牌 [编号] 或 (s)跳过"), set(valid.keys()), state=state)
+                    if choice == "__refresh__":
+                        continue
 
                 if choice == "s":
                     state = send({"cmd": "action", "action": "skip_card_reward"})
@@ -1549,6 +1629,8 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                     choice = "0"
                 else:
                     choice = get_input(t("Choose pack [index]", "选择卡牌包 [编号]"), set(valid.keys()), state=state)
+                    if choice == "__refresh__":
+                        continue
                 state = send({"cmd": "action", "action": "select_bundle",
                              "args": {"bundle_index": int(choice)}})
 
@@ -1587,6 +1669,8 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                     choice = "0"
                 else:
                     choice = get_input(t("Choose card(s) [index] or (s)kip", "选择卡牌 [编号] 或 (s)跳过"), set(valid.keys()), state=state)
+                    if choice == "__refresh__":
+                        continue
 
                 if choice == "s":
                     state = send({"cmd": "action", "action": "skip_select"})
@@ -1616,6 +1700,8 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                     choice = "leave"
                 else:
                     choice = get_input(t("Buy [index/r0/p0/rm] or (leave)", "购买 [编号/r0/p0/rm] 或 (leave)离开"), state=state)
+                    if choice == "__refresh__":
+                        continue
 
                 if choice == "leave":
                     state = send({"cmd": "action", "action": "leave_room"})
@@ -1646,6 +1732,8 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                     choice = str(pick["index"]) if pick else "0"
                 else:
                     choice = get_input(t("Choose option [index]", "选择 [编号]"), set(valid.keys()), state=state)
+                    if choice == "__refresh__":
+                        continue
 
                 state = send({"cmd": "action", "action": "choose_option",
                              "args": {"option_index": int(choice)}})
@@ -1671,6 +1759,8 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                     choice = str(unlocked[0]["index"]) if unlocked else "leave"
                 else:
                     choice = get_input(t("Choose option [index] or (leave)", "选择 [编号] 或 (leave)离开"), set(valid.keys()), state=state)
+                    if choice == "__refresh__":
+                        continue
 
                 if choice == "leave":
                     state = send({"cmd": "action", "action": "leave_room"})
