@@ -2,6 +2,115 @@
 import pytest
 
 
+def _combat_signature(state):
+    enemies = tuple(
+        (enemy.get("name"), enemy.get("hp"), enemy.get("block", 0))
+        for enemy in state.get("enemies", [])
+    )
+    return (
+        state.get("decision"),
+        state.get("round"),
+        state.get("energy"),
+        len(state.get("hand", [])),
+        enemies,
+        state.get("player", {}).get("hp"),
+    )
+
+
+def _step_autoish_run(game, state):
+    decision = state.get("decision")
+
+    if decision == "map_select":
+        choices = state.get("choices", [])
+        assert choices, "Expected at least one map choice"
+        player = state.get("player", {})
+        hp_ratio = player.get("hp", 1) / max(player.get("max_hp", 1), 1)
+        if hp_ratio < 0.4:
+            pick = next((choice for choice in choices if choice["type"] == "RestSite"), choices[0])
+        else:
+            pick = choices[0]
+        return game.act("select_map_node", col=pick["col"], row=pick["row"])
+
+    if decision == "event_choice":
+        options = [option for option in state["options"] if not option.get("is_locked")]
+        return game.act("choose_option", option_index=options[0]["index"])
+
+    if decision == "card_reward":
+        return game.act("select_card_reward", card_index=0)
+
+    if decision == "bundle_select":
+        return game.act("select_bundle", bundle_index=0)
+
+    if decision == "card_select":
+        if state.get("min_select", 0) == 0:
+            return game.act("skip_select")
+        return game.act("select_cards", indices="0")
+
+    if decision == "rest_site":
+        options = [option for option in state["options"] if option.get("is_enabled", True)]
+        heal = next((option for option in options if option.get("option_id") == "HEAL"), None)
+        pick = heal or options[0]
+        return game.act("choose_option", option_index=pick["index"])
+
+    if decision == "shop":
+        return game.act("leave_room")
+
+    return game.act("proceed")
+
+
+def _play_without_repeating_identical_combat_state(game, state, *, max_steps=120, max_repeats=2):
+    repeats = 0
+    last_signature = None
+
+    for _ in range(max_steps):
+        if state.get("decision") != "combat_play":
+            return state
+
+        signature = _combat_signature(state)
+        if signature == last_signature:
+            repeats += 1
+        else:
+            repeats = 0
+            last_signature = signature
+
+        assert repeats < max_repeats, f"Combat state repeated without progress: {signature}"
+
+        hand = state.get("hand", [])
+        energy = state.get("energy", 0)
+        playable = [card for card in hand if card.get("can_play") and card.get("cost", 99) <= energy]
+        if playable:
+            card = playable[0]
+            args = {"card_index": card["index"]}
+            if card.get("target_type") == "AnyEnemy" and state.get("enemies"):
+                args["target_index"] = state["enemies"][0]["index"]
+            state = game.act("play_card", **args)
+        else:
+            state = game.act("end_turn")
+
+    pytest.fail(f"Combat did not resolve within {max_steps} steps")
+
+
+def _advance_to_nibbit(game):
+    return _advance_to_enemy(game, character="Silent", seed="reward_probe_1", enemy_name="Nibbit")
+
+
+def _advance_to_enemy(game, *, character, seed, enemy_name, max_steps=250):
+    state = game.start(character=character, seed=seed)
+    state = game.skip_neow(state)
+
+    for _ in range(max_steps):
+        if state.get("decision") == "combat_play":
+            enemy_names = {enemy.get("name") for enemy in state.get("enemies", [])}
+            if enemy_name in enemy_names:
+                return state
+            state = _play_without_repeating_identical_combat_state(game, state, max_steps=80)
+            continue
+
+        state = _step_autoish_run(game, state)
+
+    pytest.fail(f"Did not reach the {enemy_name} combat for seed {seed}")
+
+
 class TestCombatStructure:
     def test_combat_play_fields(self, game):
         state = game.start(seed="cs1")
@@ -228,3 +337,60 @@ class TestCombatEdgeCases:
                 break
         assert state["decision"] == "game_over"
         assert state["victory"] is False
+
+    def test_reward_probe_nibbit_combat_does_not_repeat_identical_end_turn_state(self, game):
+        state = _advance_to_nibbit(game)
+
+        enemy_names = {enemy.get("name") for enemy in state.get("enemies", [])}
+        assert "Nibbit" in enemy_names
+
+        final_state = _play_without_repeating_identical_combat_state(game, state, max_steps=120)
+        assert final_state.get("type") != "error"
+
+    def test_console_fight_progresses_without_repeating_identical_state(self, game):
+        game.start(seed="ce_console_progress")
+
+        result = game.console("fight SHRINKER_BEETLE_WEAK")
+
+        assert result["type"] == "console_result"
+        state = result["state"]
+        assert state["decision"] == "combat_play"
+
+        final_state = _play_without_repeating_identical_combat_state(game, state, max_steps=80)
+        assert final_state.get("type") != "error"
+
+    def test_console_elite_fight_does_not_error_after_end_turn(self, game):
+        game.start(seed="ce_elite_progress")
+
+        result = game.console("fight BYGONE_EFFIGY_ELITE")
+
+        assert result["type"] == "console_result"
+        state = result["state"]
+        assert state["decision"] == "combat_play"
+
+        final_state = _play_without_repeating_identical_combat_state(game, state, max_steps=120)
+        assert final_state.get("type") != "error"
+
+    def test_event_probe_ceremonial_beast_does_not_error_after_end_turn(self, game):
+        state = _advance_to_enemy(
+            game,
+            character="Defect",
+            seed="event_probe_1",
+            enemy_name="Ceremonial Beast",
+            max_steps=300,
+        )
+
+        final_state = _play_without_repeating_identical_combat_state(game, state, max_steps=200)
+        assert final_state.get("type") != "error"
+
+    def test_console_phrog_parasite_elite_spawn_phase_does_not_stall(self, game):
+        game.start(seed="ce_phrog_progress")
+
+        result = game.console("fight PHROG_PARASITE_ELITE")
+
+        assert result["type"] == "console_result"
+        state = result["state"]
+        assert state["decision"] == "combat_play"
+
+        final_state = _play_without_repeating_identical_combat_state(game, state, max_steps=180)
+        assert final_state.get("type") != "error"

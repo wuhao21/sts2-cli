@@ -1041,6 +1041,22 @@ public class RunSimulator
             }
         }
 
+        if (!SpinWaitForCombatStable(maxIterations: 400, sleepMs: 10) &&
+            CombatManager.Instance.IsInProgress &&
+            !CombatManager.Instance.IsPlayPhase &&
+            player.Creature?.IsDead != true)
+        {
+            var stuckState = CombatManager.Instance.DebugOnlyGetState();
+            var stuckEnemies = stuckState?.Enemies?
+                .Where(e => e != null && e.IsAlive)
+                .Select(e => $"{e.Monster?.GetType().Name}(hp={e.CurrentHp})")
+                .ToList() ?? new();
+            return Error(
+                $"Combat did not stabilize after end_turn (round={stuckState?.RoundNumber ?? 0}, " +
+                $"play_phase={CombatManager.Instance.IsPlayPhase}, " +
+                $"enemies=[{string.Join(",", stuckEnemies)}])");
+        }
+
         return DetectDecisionPoint();
     }
 
@@ -1695,15 +1711,33 @@ public class RunSimulator
             {
                 return DetectPostCombatState(player, combatRoom);
             }
-            // Fallback: brief wait
-            for (int i = 0; i < 20; i++)
+            if (!SpinWaitForCombatStable())
             {
-                _syncCtx.Pump();
-                Thread.Sleep(5);
-                if (CombatManager.Instance.IsPlayPhase) return CombatPlayState(player);
-                if (!CombatManager.Instance.IsInProgress) return DetectPostCombatState(player, combatRoom);
+                var combatState = CombatManager.Instance.DebugOnlyGetState();
+                return Error(
+                    $"Combat did not reach a stable decision state (round={combatState?.RoundNumber ?? 0}, " +
+                    $"play_phase={CombatManager.Instance.IsPlayPhase}, " +
+                    $"in_progress={CombatManager.Instance.IsInProgress})");
             }
-            return CombatPlayState(player);
+
+            // Re-check after stabilization because pending card selections and combat
+            // completion can be created while pumping queued continuations.
+            if (_cardSelector.HasPending && _cardSelector.PendingOptions != null)
+            {
+                goto checkCardSelect;
+            }
+
+            if (CombatManager.Instance.IsInProgress && CombatManager.Instance.IsPlayPhase)
+            {
+                return CombatPlayState(player);
+            }
+
+            if (!CombatManager.Instance.IsInProgress || (player.Creature != null && player.Creature.IsDead))
+            {
+                return DetectPostCombatState(player, combatRoom);
+            }
+
+            return Error("Combat remained in an intermediate state");
         }
 
         // Event room
@@ -2504,18 +2538,31 @@ public class RunSimulator
         }
     }
 
-    private void SpinWaitForCombatStable()
+    private bool SpinWaitForCombatStable(int maxIterations = 200, int sleepMs = 5)
     {
-        int maxIterations = 200;
         for (int i = 0; i < maxIterations; i++)
         {
             _syncCtx.Pump();
-            if (!CombatManager.Instance.IsInProgress) return;
-            if (CombatManager.Instance.IsPlayPhase) return;
             WaitForActionExecutor();
-            if (CombatManager.Instance.IsPlayPhase || !CombatManager.Instance.IsInProgress) return;
-            Thread.Sleep(5);
+
+            if (!CombatManager.Instance.IsInProgress) return true;
+            if (CombatManager.Instance.IsPlayPhase) return true;
+            if (_cardSelector.HasPending && _cardSelector.PendingOptions != null) return true;
+
+            WaitForActionExecutor();
+            if (!CombatManager.Instance.IsInProgress) return true;
+            if (CombatManager.Instance.IsPlayPhase) return true;
+            if (_cardSelector.HasPending && _cardSelector.PendingOptions != null) return true;
+
+            Thread.Sleep(sleepMs);
         }
+
+        _syncCtx.Pump();
+        WaitForActionExecutor();
+
+        return !CombatManager.Instance.IsInProgress ||
+               CombatManager.Instance.IsPlayPhase ||
+               (_cardSelector.HasPending && _cardSelector.PendingOptions != null);
     }
 
     /// <summary>Compute what a card would look like after upgrading (stats + cost + description).</summary>
@@ -2685,6 +2732,12 @@ public class RunSimulator
         // because there's no Godot scene tree, causing the ActionExecutor to deadlock.
         PatchCmdWait();
 
+        // Patch purely visual low-HP vignette hooks to no-op in headless mode.
+        // Some enemy attacks transition the combat into the enemy side correctly, but
+        // then crash while trying to create UI-only VFX nodes. That aborts the enemy
+        // turn and leaves combat permanently between phases.
+        PatchHeadlessOnlyVfx();
+
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
 
@@ -2801,6 +2854,49 @@ public class RunSimulator
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[WARN] Failed to patch Cmd.Wait: {ex.Message}");
+        }
+    }
+
+    private static void PatchHeadlessOnlyVfx()
+    {
+        try
+        {
+            var harmony = new Harmony("sts2headless.vfx");
+            var coreAssembly = typeof(MegaCrit.Sts2.Core.Commands.CardPileCmd).Assembly;
+
+            var helperType = coreAssembly.GetType("MegaCrit.Sts2.Core.Nodes.Vfx.PlayerHurtVignetteHelper");
+            var helperPlay = helperType?.GetMethod("Play",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance,
+                null, Type.EmptyTypes, null);
+            if (helperPlay != null)
+            {
+                var prefix = typeof(YieldPatches).GetMethod(nameof(YieldPatches.SkipVoidPrefix),
+                    BindingFlags.Static | BindingFlags.Public);
+                if (prefix != null)
+                {
+                    harmony.Patch(helperPlay, new HarmonyMethod(prefix));
+                    Console.Error.WriteLine("[INFO] Patched PlayerHurtVignetteHelper.Play() to no-op in headless mode");
+                }
+            }
+
+            var lowHpType = coreAssembly.GetType("MegaCrit.Sts2.Core.Nodes.Vfx.Ui.NLowHpBorderVfx");
+            var lowHpCreate = lowHpType?.GetMethod("Create",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance,
+                null, Type.EmptyTypes, null);
+            if (lowHpCreate != null)
+            {
+                var prefix = typeof(YieldPatches).GetMethod(nameof(YieldPatches.SkipReferenceReturnPrefix),
+                    BindingFlags.Static | BindingFlags.Public);
+                if (prefix != null)
+                {
+                    harmony.Patch(lowHpCreate, new HarmonyMethod(prefix));
+                    Console.Error.WriteLine("[INFO] Patched NLowHpBorderVfx.Create() to no-op in headless mode");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch headless-only VFX: {ex.Message}");
         }
     }
 
@@ -2966,6 +3062,14 @@ public class RunSimulator
         {
             __result = Task.CompletedTask;
             return false; // Skip original method
+        }
+
+        public static bool SkipVoidPrefix() => false;
+
+        public static bool SkipReferenceReturnPrefix(ref object? __result)
+        {
+            __result = null;
+            return false;
         }
     }
 
