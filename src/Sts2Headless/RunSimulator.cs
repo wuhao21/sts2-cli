@@ -224,6 +224,8 @@ public class RunSimulator
     private int _goldBeforeCombat;
     private int _lastKnownHp;
     private readonly HeadlessCardSelector _cardSelector = new();
+    private IDisposable? _cardSelectorScope;
+    private bool _combatHandlersRegistered;
     // Pending bundle selection (Scroll Boxes: pick 1 of N packs)
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
     private TaskCompletionSource<IEnumerable<CardModel>>? _pendingBundleTcs;
@@ -232,6 +234,7 @@ public class RunSimulator
     {
         try
         {
+            CleanUp();
             _loc.Lang = lang;
             EnsureModelDbInitialized();
 
@@ -266,8 +269,12 @@ public class RunSimulator
             Log("Run launched");
 
             // Register event handlers for combat turn transitions
-            CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
-            CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
+            if (!_combatHandlersRegistered)
+            {
+                CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
+                CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
+                _combatHandlersRegistered = true;
+            }
 
             // Finalize starting relics
             RunManager.Instance.FinalizeStartingRelics().GetAwaiter().GetResult();
@@ -278,7 +285,7 @@ public class RunSimulator
             Log("Entered Act 0");
 
             // Register card selector for cards that need player choice
-            CardSelectCmd.UseSelector(_cardSelector);
+            _cardSelectorScope = CardSelectCmd.UseSelector(_cardSelector);
             LocPatches._bundleSimRef = this;
 
             // Now we should be at the map — detect decision point
@@ -486,6 +493,7 @@ public class RunSimulator
     {
         try
         {
+            CleanUp();
             _loc.Lang = lang;
             EnsureModelDbInitialized();
 
@@ -511,9 +519,13 @@ public class RunSimulator
             RunManager.Instance.SetUpSavedSinglePlayer(_runState, save);
             LocalContext.NetId = netService.NetId;
 
-            CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
-            CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
-            CardSelectCmd.UseSelector(_cardSelector);
+            if (!_combatHandlersRegistered)
+            {
+                CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
+                CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
+                _combatHandlersRegistered = true;
+            }
+            _cardSelectorScope = CardSelectCmd.UseSelector(_cardSelector);
             LocPatches._bundleSimRef = this;
 
             var savedRoom = _runState.CurrentRoom;
@@ -3094,6 +3106,21 @@ public class RunSimulator
             _rewardChoice = -1;
             _rewardWait?.Set();
         }
+
+        public void Reset()
+        {
+            var pendingTcs = _pendingTcs;
+            var rewardWait = _rewardWait;
+
+            PendingOptions = null;
+            _pendingTcs = null;
+            _rewardChoice = -1;
+            PendingRewardCards = null;
+            _rewardWait = null;
+
+            pendingTcs?.TrySetResult(Array.Empty<CardModel>());
+            rewardWait?.Set();
+        }
     }
 
     internal static class YieldPatches
@@ -3573,11 +3600,38 @@ public class RunSimulator
             if (RunManager.Instance.IsInProgress)
                 RunManager.Instance.CleanUp(graceful: true);
             _runState = null;
+            ResetPerRunFields();
         }
         catch (Exception ex)
         {
             Log($"CleanUp exception: {ex.Message}");
         }
+    }
+
+    private void ResetPerRunFields()
+    {
+        try
+        {
+            _cardSelectorScope?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Log($"Card selector dispose exception: {ex.Message}");
+        }
+        _cardSelectorScope = null;
+        CardSelectCmd.Reset();
+        _cardSelector.Reset();
+        _eventOptionChosen = false;
+        _lastEventOptionCount = 0;
+        _pendingRewards = null;
+        _pendingCardReward = null;
+        _rewardsProcessed = false;
+        _goldBeforeCombat = 0;
+        _lastKnownHp = 0;
+        _pendingBundles = null;
+        _pendingBundleTcs = null;
+        _turnStarted.Reset();
+        _combatEnded.Reset();
     }
 
     #endregion
