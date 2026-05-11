@@ -1445,9 +1445,11 @@ public class RunSimulator
         Creature? target = null;
         var potionTargetType = potion.TargetType;
 
-        // Self-targeting potions (Flex, Fortifier, etc.) ALWAYS target the player
+        // Player-targeting potions (Flex, Fortifier, Liquid Bronze, etc.) ALWAYS target the player
         // regardless of any target_index the caller provides
-        if (potionTargetType == TargetType.Self || potionTargetType == TargetType.TargetedNoCreature)
+        if (potionTargetType == TargetType.Self
+            || potionTargetType == TargetType.TargetedNoCreature
+            || potionTargetType == TargetType.AnyPlayer)
         {
             target = player.Creature;
         }
@@ -2072,6 +2074,7 @@ public class RunSimulator
                 // Enemy powers
                 var ePowers = e.Powers?.Select(pw => new Dictionary<string, object?>
                 {
+                    ["id"] = pw.Id.Entry,
                     ["name"] = _loc.Power(pw.Id.Entry),
                     ["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description"),
                     ["amount"] = pw.Amount,
@@ -2093,6 +2096,7 @@ public class RunSimulator
         // Player powers/buffs
         var playerPowers = player.Creature?.Powers?.Select(pw => new Dictionary<string, object?>
         {
+            ["id"] = pw.Id.Entry,
             ["name"] = _loc.Power(pw.Id.Entry),
             ["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description"),
             ["amount"] = pw.Amount,
@@ -2734,6 +2738,7 @@ public class RunSimulator
                 return new Dictionary<string, object?>
                 {
                     ["index"] = i,
+                    ["id"] = p.Id.Entry,
                     ["name"] = _loc.Potion(p.Id.Entry),
                     ["description"] = _loc.Bilingual("potions", p.Id.Entry + ".description"),
                     ["vars"] = pvars.Count > 0 ? pvars : null,
