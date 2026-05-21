@@ -12,4 +12,5 @@ obj/
 .DS_Store
 .obsidian/
 logs/
+data_sts2_macos_arm64/
 saves/*

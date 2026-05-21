@@ -859,7 +859,8 @@ def print_card_detail_extension(card, indent="      "):
         if line:
             print(f"{indent}{c(line, 'dim')}")
     stats = card.get("stats") or {}
-    aug_parts = _format_upgrade_preview(stats, card.get("after_upgrade"), card.get("cost"))
+    current_cost = card.get("card_cost") if "card_cost" in card else card.get("cost")
+    aug_parts = _format_upgrade_preview(stats, card.get("after_upgrade"), current_cost)
     if aug_parts:
         print(f"{indent}{c(t('upgrade:','升级:'), 'green')} {', '.join(aug_parts)}")
 
@@ -1508,6 +1509,17 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
         while True:
             l = proc.stdout.readline().strip()
             if not l:
+                # Engine process ended — capture stderr for diagnostics
+                try:
+                    stderr_out = proc.stderr.read()
+                    if stderr_out:
+                        lines = stderr_out.strip().splitlines()
+                        last_lines = lines[-20:] if len(lines) > 20 else lines
+                        print(f"\n  {c(t('Engine crashed. Last stderr:','引擎崩溃。错误输出:'), 'red')}")
+                        for sl in last_lines:
+                            print(f"    {sl}")
+                except Exception:
+                    pass
                 return None
             if l.startswith("{"):
                 resp = json.loads(l)
@@ -1518,8 +1530,11 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
         logger.log_action(cmd)
         if record and cmd.get("cmd") == "action":
             action_log.append(cmd)
-        proc.stdin.write(json.dumps(cmd) + "\n")
-        proc.stdin.flush()
+        try:
+            proc.stdin.write(json.dumps(cmd) + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return read()  # will capture stderr and return None
         return read()
 
     # Wire send into get_input for map command

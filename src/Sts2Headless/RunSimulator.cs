@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text.RegularExpressions;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Commands;
 using MegaCrit.Sts2.Core.Context;
@@ -1605,9 +1606,19 @@ public class RunSimulator
                             return DetectDecisionPoint();
                         }
                         if (!task.IsCompleted) task.Wait(2000);
+                        if (task.IsFaulted)
+                            Log($"Event Chosen() faulted: {task.Exception?.InnerException?.Message ?? task.Exception?.Message}");
                         _syncCtx.Pump();
                     }
                     catch (Exception ex) { Log($"Event choose: {ex.Message}"); }
+                }
+
+                // Let ActionExecutor process queued game actions (heal, upgrade, etc.)
+                WaitForActionExecutor();
+
+                if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+                {
+                    return DetectDecisionPoint();
                 }
 
                 var optCountAfter = localEvent.CurrentOptions?.Count ?? 0;
@@ -2070,30 +2081,49 @@ public class RunSimulator
             .Where(e => e != null && e.IsAlive)
             .Select((e, i) =>
             {
-                // Extract detailed intent info
+                // Extract detailed intent info (including FollowUpState chain)
                 var intents = new List<Dictionary<string, object?>>();
                 try
                 {
-                    if (e.Monster?.NextMove?.Intents != null)
+                    var moveState = e.Monster?.NextMove;
+                    // Walk the FollowUpState chain to capture intents from all moves
+                    // that will execute in the same turn (e.g. WakeMove → SlashMove)
+                    var visited = new HashSet<string>();
+                    while (moveState != null)
                     {
-                        foreach (var intent in e.Monster.NextMove.Intents)
+                        // Guard against cycles
+                        var stateId = moveState.StateId ?? moveState.Id ?? "";
+                        if (!visited.Add(stateId)) break;
+
+                        if (moveState.Intents != null)
                         {
-                            var intentInfo = new Dictionary<string, object?>
+                            foreach (var intent in moveState.Intents)
                             {
-                                ["type"] = intent.IntentType.ToString(),
-                            };
-                            // Get damage for attack intents
-                            if (intent is MegaCrit.Sts2.Core.MonsterMoves.Intents.AttackIntent atk && playerCreatures != null)
-                            {
-                                try
+                                var intentInfo = new Dictionary<string, object?>
                                 {
-                                    intentInfo["damage"] = atk.GetTotalDamage(playerCreatures, e);
-                                    if (atk.Repeats > 1) intentInfo["hits"] = atk.Repeats;
+                                    ["type"] = intent.IntentType.ToString(),
+                                };
+                                // Get damage for attack intents
+                                if (intent is MegaCrit.Sts2.Core.MonsterMoves.Intents.AttackIntent atk && playerCreatures != null)
+                                {
+                                    try
+                                    {
+                                        intentInfo["damage"] = atk.GetTotalDamage(playerCreatures, e);
+                                        if (atk.Repeats > 1) intentInfo["hits"] = atk.Repeats;
+                                    }
+                                    catch { }
                                 }
-                                catch { }
+                                intents.Add(intentInfo);
                             }
-                            intents.Add(intentInfo);
                         }
+
+                        // Follow the chain: FollowUpState may point to another MoveState
+                        try
+                        {
+                            var followUp = moveState.FollowUpState;
+                            moveState = followUp as MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine.MoveState;
+                        }
+                        catch { moveState = null; }
                     }
                 }
                 catch { }
@@ -2114,7 +2144,8 @@ public class RunSimulator
                     ["max_hp"] = e.MaxHp,
                     ["block"] = e.Block,
                     ["intents"] = intents.Count > 0 ? intents : null,
-                    ["intends_attack"] = e.Monster?.IntendsToAttack ?? false,
+                    ["intends_attack"] = (e.Monster?.IntendsToAttack ?? false) ||
+                                         intents.Any(it => it.TryGetValue("type", out var t) && t?.ToString() == "Attack"),
                     ["powers"] = ePowers?.Count > 0 ? ePowers : null,
                 };
             }).ToList() ?? new();
@@ -2533,9 +2564,18 @@ public class RunSimulator
                     if (card != null)
                     {
                         cardCost = card.EnergyCost?.GetResolved() ?? 0;
-                        var mutable = card.ToMutable();
-                        foreach (var dv in mutable.DynamicVars.Values)
-                            stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue;
+                        try
+                        {
+                            var mutable = card.ToMutable();
+                            foreach (var dv in mutable.DynamicVars.Values)
+                                stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue;
+                        }
+                        catch { }
+                        // Fallback: compute base stats from upgrade preview
+                        if (stats.Count == 0)
+                        {
+                            stats = GetBaseStatsFromUpgrade(card);
+                        }
                     }
                 }
                 catch { }
@@ -2557,22 +2597,58 @@ public class RunSimulator
                 };
             }).ToList();
 
-        var relics = inv.RelicEntries.Select((e, i) => new Dictionary<string, object?>
+        var relics = inv.RelicEntries.Select((e, i) =>
         {
-            ["index"] = i,
-            ["name"] = _loc.Relic(e.Model?.Id.Entry ?? "?"),
-            ["description"] = _loc.Bilingual("relics", (e.Model?.Id.Entry ?? "?") + ".description"),
-            ["cost"] = e.Cost,
-            ["is_stocked"] = e.IsStocked,
+            var rvars = new Dictionary<string, object?>();
+            var entry = e.Model?.Id.Entry ?? "?";
+            var descEn = _loc.En("relics", entry + ".description") ?? "";
+            try
+            {
+                if (e.Model != null)
+                {
+                    foreach (var dv in e.Model.DynamicVars.Values)
+                        rvars[dv.Name] = (int)dv.BaseValue;
+                    if (rvars.Count == 0)
+                        rvars = ExtractDynamicVarsFromDescription(e.Model, descEn);
+                }
+            }
+            catch { }
+            return new Dictionary<string, object?>
+            {
+                ["index"] = i,
+                ["name"] = _loc.Relic(entry),
+                ["description"] = _loc.Bilingual("relics", entry + ".description"),
+                ["cost"] = e.Cost,
+                ["is_stocked"] = e.IsStocked,
+                ["vars"] = rvars.Count > 0 ? rvars : null,
+            };
         }).ToList();
 
-        var potions = inv.PotionEntries.Select((e, i) => new Dictionary<string, object?>
+        var potions = inv.PotionEntries.Select((e, i) =>
         {
-            ["index"] = i,
-            ["name"] = _loc.Potion(e.Model?.Id.Entry ?? "?"),
-            ["description"] = _loc.Bilingual("potions", (e.Model?.Id.Entry ?? "?") + ".description"),
-            ["cost"] = e.Cost,
-            ["is_stocked"] = e.IsStocked,
+            var pvars = new Dictionary<string, object?>();
+            var entry = e.Model?.Id.Entry ?? "?";
+            var descEn = _loc.En("potions", entry + ".description") ?? "";
+            try
+            {
+                if (e.Model != null)
+                {
+                    foreach (var dv in e.Model.DynamicVars.Values)
+                        pvars[dv.Name] = (int)dv.BaseValue;
+                    if (pvars.Count == 0)
+                        pvars = ExtractDynamicVarsFromDescription(e.Model, descEn);
+                }
+            }
+            catch { }
+            return new Dictionary<string, object?>
+            {
+                ["index"] = i,
+                ["name"] = _loc.Potion(entry),
+                ["description"] = _loc.Bilingual("potions", entry + ".description"),
+                ["cost"] = e.Cost,
+                ["is_stocked"] = e.IsStocked,
+                ["vars"] = pvars.Count > 0 ? pvars : null,
+            };
         }).ToList();
 
         var removal = merchantRoom.Inventory.CardRemovalEntry;
@@ -2734,6 +2810,84 @@ public class RunSimulator
             };
         }
         catch { return null; }
+    }
+
+    /// <summary>
+    /// Get base stats for a card outside of combat context.
+    /// DynamicVars are only populated during UpgradeInternal(). We upgrade a clone to
+    /// discover var names, then read the original card's DynamicVars by name — accessing
+    private Dictionary<string, object?> ExtractDynamicVarsFromDescription(dynamic model, string description)
+    {
+        var result = new Dictionary<string, object?>();
+        try
+        {
+            var matches = Regex.Matches(description, @"\{(\w+)(?:[:\}])");
+            foreach (Match m in matches)
+            {
+                var varName = m.Groups[1].Value;
+                if (result.ContainsKey(varName)) continue;
+                try
+                {
+                    var dv = model.DynamicVars[varName];
+                    if (dv != null)
+                        result[varName] = (int)dv.BaseValue;
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return result;
+    }
+
+    /// by indexer works even when iterating Values yields nothing.
+    /// </summary>
+    private Dictionary<string, object?> GetBaseStatsFromUpgrade(CardModel card)
+    {
+        var result = new Dictionary<string, object?>();
+        try
+        {
+            // Step 1: upgrade a clone to discover DynamicVar names
+            var clone = ModelDb.GetById<CardModel>(card.Id).ToMutable();
+            for (int i = 0; i < card.CurrentUpgradeLevel; i++)
+            {
+                clone.UpgradeInternal();
+                clone.FinalizeUpgradeInternal();
+            }
+            clone.UpgradeInternal();
+            var varNames = new List<string>();
+            foreach (var dv in clone.DynamicVars.Values)
+                varNames.Add(dv.Name);
+
+            if (varNames.Count == 0) return result;
+
+            // Step 2: read base values from the ORIGINAL card by name
+            var baseCard = ModelDb.GetById<CardModel>(card.Id).ToMutable();
+            for (int i = 0; i < card.CurrentUpgradeLevel; i++)
+            {
+                baseCard.UpgradeInternal();
+                baseCard.FinalizeUpgradeInternal();
+            }
+            // Don't upgrade — try to read DynamicVars by name at current level
+            foreach (var name in varNames)
+            {
+                try
+                {
+                    var dv = baseCard.DynamicVars[name];
+                    if (dv != null)
+                        result[name.ToLowerInvariant()] = (int)dv.BaseValue;
+                }
+                catch { }
+            }
+
+            // Step 3: if still empty, use upgraded values as fallback
+            if (result.Count == 0)
+            {
+                foreach (var dv in clone.DynamicVars.Values)
+                    result[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue;
+            }
+        }
+        catch { }
+        return result;
     }
 
     private Dictionary<string, object?> PlayerSummary(Player player)
