@@ -1022,13 +1022,11 @@ public class RunSimulator
         return DetectDecisionPoint();
     }
 
-    // STS2 build 23372702 removed CombatManager.IsPlayPhase (global) in favor of a
-    // per-player PlayerCombatState.Phase. Headless is single-player, so the local
-    // player (Players[0]) being in the Play phase is the equivalent signal.
+    // Newer STS2 builds removed PlayerCombatState.Phase / PlayerTurnPhase in favor of a
+    // simple CombatManager.Instance.IsPlayPhase property.
     private bool IsPlayPhase()
     {
-        var p = (_runState != null && _runState.Players.Count > 0) ? _runState.Players[0] : null;
-        return p?.PlayerCombatState?.Phase == MegaCrit.Sts2.Core.Combat.PlayerTurnPhase.Play;
+        return CombatManager.Instance.IsPlayPhase;
     }
 
     private Dictionary<string, object?> DoEndTurn(Player player)
@@ -1276,8 +1274,8 @@ public class RunSimulator
             return Error("buy_card requires 'card_index'");
 
         var idx = Convert.ToInt32(args["card_index"]);
-        var allEntries = merchantRoom.GetLocalInventory().CharacterCardEntries
-            .Concat(merchantRoom.GetLocalInventory().ColorlessCardEntries).ToList();
+        var allEntries = merchantRoom.Inventory.CharacterCardEntries
+            .Concat(merchantRoom.Inventory.ColorlessCardEntries).ToList();
         if (idx < 0 || idx >= allEntries.Count)
             return Error($"Invalid card index {idx}");
 
@@ -1287,7 +1285,7 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
+            entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
             _syncCtx.Pump();
             Log($"Bought card: {entry.CreationResult?.Card?.GetType().Name ?? "?"} for {entry.Cost}g");
         }
@@ -1304,7 +1302,7 @@ public class RunSimulator
             return Error("buy_relic requires 'relic_index'");
 
         var idx = Convert.ToInt32(args["relic_index"]);
-        var entries = merchantRoom.GetLocalInventory().RelicEntries;
+        var entries = merchantRoom.Inventory.RelicEntries;
         if (idx < 0 || idx >= entries.Count) return Error($"Invalid relic index {idx}");
 
         var entry = entries[idx];
@@ -1317,7 +1315,7 @@ public class RunSimulator
             // Adroit, #80). Run the purchase on a background task and yield as soon as a
             // pending selection appears so the caller can resolve it; the background task
             // continues once the selector's TCS is fed by select_cards.
-            var inv = merchantRoom.GetLocalInventory();
+            var inv = merchantRoom.Inventory;
             var task = Task.Run(() => entry.OnTryPurchaseWrapper(inv));
             for (int i = 0; i < 100; i++)
             {
@@ -1349,7 +1347,7 @@ public class RunSimulator
             return Error("buy_potion requires 'potion_index'");
 
         var idx = Convert.ToInt32(args["potion_index"]);
-        var entries = merchantRoom.GetLocalInventory().PotionEntries;
+        var entries = merchantRoom.Inventory.PotionEntries;
         if (idx < 0 || idx >= entries.Count) return Error($"Invalid potion index {idx}");
 
         var entry = entries[idx];
@@ -1358,7 +1356,7 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
+            entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
             _syncCtx.Pump();
             Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1376,14 +1374,14 @@ public class RunSimulator
         if (_runState?.CurrentRoom is not MerchantRoom merchantRoom)
             return Error("Not in a shop");
 
-        var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
+        var removal = merchantRoom.Inventory.CardRemovalEntry;
         if (removal == null) return Error("No card removal available");
         if (player.Gold < removal.Cost) return Error("Not enough gold");
 
         try
         {
             // Run on background thread so card selection can pause (same pattern as event options)
-            var task = Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()));
+            var task = Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.Inventory));
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -2374,7 +2372,7 @@ public class RunSimulator
                     if (reward is GoldReward || reward is MegaCrit.Sts2.Core.Rewards.RelicReward
                         || reward is MegaCrit.Sts2.Core.Rewards.PotionReward)
                     {
-                        try { reward.SelectUnsynchronized().GetAwaiter().GetResult(); _syncCtx.Pump(); }
+                        try { reward.OnSelectWrapper().GetAwaiter().GetResult(); _syncCtx.Pump(); }
                         catch (Exception ex) { Log($"Auto-collect reward: {ex.Message}"); }
                     }
                     else if (reward is CardReward cr)
@@ -2690,7 +2688,7 @@ public class RunSimulator
 
     private Dictionary<string, object?> ShopState(MerchantRoom merchantRoom, Player player)
     {
-        var inv = merchantRoom.GetLocalInventory();
+        var inv = merchantRoom.Inventory;
         if (inv == null) { ForceToMap(); return MapSelectState(); }
 
         var cards = inv.CharacterCardEntries.Concat(inv.ColorlessCardEntries)
@@ -2755,7 +2753,7 @@ public class RunSimulator
             ["is_stocked"] = e.IsStocked,
         }).ToList();
 
-        var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
+        var removal = merchantRoom.Inventory.CardRemovalEntry;
 
         return new Dictionary<string, object?>
         {
@@ -3367,15 +3365,15 @@ public class RunSimulator
         private ManualResetEventSlim? _rewardWait;
         private int _rewardChoice = -1;
 
-        // NOTE: STS2 build 23372702 changed ICardSelector.GetSelectedCardReward to return
-        // a CardRewardSelection struct { CardModel card; CardRewardAlternative alternative }.
-        // CardReward.OnSelect interprets: alternative != null → pick that alternative
-        // (Skip/Reroll); else card != null → take that card; both null → skip (no card kept).
-        public MegaCrit.Sts2.Core.TestSupport.CardRewardSelection GetSelectedCardReward(
-            IReadOnlyList<MegaCrit.Sts2.Core.Entities.Cards.CardCreationResult> options,
+        // NOTE: STS2 post-build 23372702 reverted ICardSelector.GetSelectedCardReward
+        // back to a `CardModel?` return type. Null means skip; non-null means take that card.
+        // (An earlier intermediate build used a CardRewardSelection struct { card, alternative }
+        //  here, but it has since been removed upstream.)
+        public CardModel? GetSelectedCardReward(
+            IReadOnlyList<CardCreationResult> options,
             IReadOnlyList<CardRewardAlternative> alternatives)
         {
-            if (options.Count == 0) return default;  // Skip
+            if (options.Count == 0) return null;  // Skip
 
             // Store pending and block until main loop resolves
             PendingRewardCards = options.ToList();
@@ -3390,8 +3388,8 @@ public class RunSimulator
             _rewardWait = null;
 
             if (choice >= 0 && choice < options.Count)
-                return new MegaCrit.Sts2.Core.TestSupport.CardRewardSelection { card = options[choice].Card };
-            return default;  // Skip (card=null, alternative=null)
+                return options[choice].Card;
+            return null;  // Skip
         }
 
         public bool HasPendingReward => PendingRewardCards != null && _rewardWait != null;
@@ -3735,7 +3733,7 @@ public class RunSimulator
             {
                 await CreatureCmd.Damage(ctx, play.Target!, card.DynamicVars.Damage.BaseValue,
                     MegaCrit.Sts2.Core.ValueProps.ValueProp.Move, card);
-                await PowerCmd.Apply<WeakPower>(ctx, play.Target!, card.DynamicVars["WeakPower"].BaseValue,
+                await PowerCmd.Apply<WeakPower>(play.Target!, card.DynamicVars["WeakPower"].BaseValue,
                     card.Owner.Creature, card, false);
             }
             catch (Exception ex) { Console.Error.WriteLine($"[WARN] Neutralize safe: {ex.Message}"); }

@@ -13,3 +13,4 @@ obj/
 .obsidian/
 logs/
 saves/*
+test_scripts/
