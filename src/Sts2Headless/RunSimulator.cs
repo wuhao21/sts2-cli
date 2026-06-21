@@ -517,7 +517,7 @@ public class RunSimulator
             Log($"RunState created, players={_runState.Players?.Count}");
 
             var netService = new NetSingleplayerGameService();
-            RunManager.Instance.SetUpSavedSinglePlayer(_runState, save);
+            RunManager.Instance.SetUpTest(_runState, netService);
             LocalContext.NetId = netService.NetId;
 
             CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
