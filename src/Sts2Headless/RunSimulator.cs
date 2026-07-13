@@ -229,7 +229,7 @@ public class RunSimulator
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
     private TaskCompletionSource<IEnumerable<CardModel>>? _pendingBundleTcs;
 
-    public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en")
+    public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en", bool neow = true)
     {
         try
         {
@@ -255,8 +255,8 @@ public class RunSimulator
             RunManager.Instance.SetUpTest(_runState, netService);
             LocalContext.NetId = netService.NetId;
 
-            // Force Neow event (blessing selection at start)
-            _runState.ExtraFields.StartedWithNeow = true;
+            // Neow event (blessing selection at start) — can be disabled for direct combat
+            _runState.ExtraFields.StartedWithNeow = neow;
 
             // Generate rooms for all acts
             RunManager.Instance.GenerateRooms();
