@@ -178,6 +178,30 @@ class Program
                 return sim.EnterRoom(roomType, encounter, eventId);
             }
 
+            case "setup_combat":
+            {
+                var scCharacter = cmd.TryGetProperty("character", out var scCh) ? scCh.GetString() ?? "Ironclad" : "Ironclad";
+                var scEncounter = cmd.TryGetProperty("encounter", out var scEnc) ? scEnc.GetString() ?? "SHRINKER_BEETLE_WEAK" : "SHRINKER_BEETLE_WEAK";
+                var scAscension = cmd.TryGetProperty("ascension", out var scAsc) ? scAsc.GetInt32() : 10;
+                var scSeed = cmd.TryGetProperty("seed", out var scSd) ? scSd.GetString() : null;
+                var scHp = cmd.TryGetProperty("hp", out var scHpEl) ? scHpEl.GetInt32() : 80;
+                var scMaxHp = cmd.TryGetProperty("max_hp", out var scMhpEl) ? scMhpEl.GetInt32() : 80;
+                var scGold = cmd.TryGetProperty("gold", out var scGEl) ? scGEl.GetInt32() : 99;
+                var scLang = cmd.TryGetProperty("lang", out var scLa) ? scLa.GetString() ?? "en" : "en";
+
+                var scRelics = new List<string>();
+                if (cmd.TryGetProperty("relics", out var scRelicsArr))
+                    foreach (var r in scRelicsArr.EnumerateArray())
+                        scRelics.Add(r.GetString() ?? "");
+
+                var scDeck = new List<string>();
+                if (cmd.TryGetProperty("deck", out var scDeckArr))
+                    foreach (var d in scDeckArr.EnumerateArray())
+                        scDeck.Add(d.GetString() ?? "");
+
+                return sim.SetupCombat(scCharacter, scEncounter, scAscension, scSeed, scHp, scMaxHp, scGold, scRelics, scDeck, scLang);
+            }
+
             case "set_draw_order":
             {
                 var cards = new List<string>();

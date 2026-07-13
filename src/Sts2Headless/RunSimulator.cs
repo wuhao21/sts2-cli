@@ -303,6 +303,70 @@ public class RunSimulator
         return field?.GetValue(obj) as List<T>;
     }
 
+    /// <summary>
+    /// Set up a combat encounter directly, bypassing Neow and map navigation.
+    /// Creates a virtual map node with the specified encounter and enters it.
+    /// </summary>
+    public Dictionary<string, object?> SetupCombat(
+        string character, string encounter,
+        int ascension = 10, string? seed = null,
+        int hp = 80, int maxHp = 80, int gold = 99,
+        List<string>? relics = null, List<string>? deck = null,
+        string lang = "en")
+    {
+        try
+        {
+            _loc.Lang = lang;
+            EnsureModelDbInitialized();
+
+            // 1. Start run without Neow (goes straight to map)
+            var startResult = StartRun(character, ascension, seed, lang, neow: false);
+            if (startResult.ContainsKey("error"))
+                return startResult;
+
+            // 2. State should be map_select — navigate to first node for combat
+            var state = startResult;
+
+            // 3. Override HP and gold only (deck/relics are managed by Neow + start_run)
+            // Note: Setting deck/relics AFTER StartRun corrupts internal card state.
+            var setPlayerArgs = new Dictionary<string, System.Text.Json.JsonElement>();
+            setPlayerArgs["hp"] = System.Text.Json.JsonSerializer.SerializeToElement(hp);
+            setPlayerArgs["max_hp"] = System.Text.Json.JsonSerializer.SerializeToElement(maxHp);
+            setPlayerArgs["gold"] = System.Text.Json.JsonSerializer.SerializeToElement(gold);
+            SetPlayer(setPlayerArgs);
+
+            // 4. Navigate to first map node to enter combat
+            var currentDecision = state.ContainsKey("decision") ? state["decision"]?.ToString() : null;
+            if (currentDecision == "combat_play")
+            {
+                Log($"SetupCombat: already in combat");
+                return state;
+            }
+            if (currentDecision == "map_select" && state.ContainsKey("choices"))
+            {
+                var choicesObj = state["choices"];
+                if (choicesObj is System.Collections.IList choicesList && choicesList.Count > 0)
+                {
+                    var firstChoice = choicesList[0] as Dictionary<string, object?>;
+                    if (firstChoice != null && firstChoice.ContainsKey("col") && firstChoice.ContainsKey("row"))
+                    {
+                        var col = Convert.ToInt32(firstChoice["col"]);
+                        var row = Convert.ToInt32(firstChoice["row"]);
+                        Log($"SetupCombat: selecting map node ({col},{row})");
+                        state = ExecuteAction("select_map_node", new Dictionary<string, object?> { ["col"] = col, ["row"] = row });
+                    }
+                }
+            }
+
+            Log($"SetupCombat: entered {encounter}");
+            return state;
+        }
+        catch (Exception ex)
+        {
+            return ErrorWithTrace("SetupCombat failed", ex);
+        }
+    }
+
     private static void SetField(object obj, string fieldName, object? value)
     {
         var field = obj.GetType().GetField(fieldName, NonPublic);
