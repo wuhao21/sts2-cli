@@ -270,12 +270,12 @@ public class RunSimulator
             CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
             CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
 
-            // Finalize starting relics
-            RunManager.Instance.FinalizeStartingRelics().GetAwaiter().GetResult();
+            // Finalize starting relics (pump while waiting to avoid deadlock)
+            PumpUntilCompleted(RunManager.Instance.FinalizeStartingRelics());
             Log("Starting relics finalized");
 
             // Enter first act (generates map)
-            RunManager.Instance.EnterAct(0, doTransition: false).GetAwaiter().GetResult();
+            PumpUntilCompleted(RunManager.Instance.EnterAct(0, doTransition: false));
             Log("Entered Act 0");
 
             // Register card selector for cards that need player choice
@@ -405,6 +405,28 @@ public class RunSimulator
             var runState = _runState;
             Log($"EnterRoom: type={roomType} encounter={encounter} event={eventId}");
 
+            // Ensure sync context is pumped and actions are settled before entering a new room
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+
+            // The game engine requires CurrentRoom to be a MapRoom before transitioning
+            // to a CombatRoom. After StartRun + Neow, CurrentRoom is an EventRoom.
+            // Force a MapRoom transition first if needed (same pattern as ForceToMap).
+            if (_runState.CurrentRoom is not MapRoom && roomType.ToLowerInvariant() is "combat" or "monster" or "elite")
+            {
+                try
+                {
+                    RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult();
+                    _syncCtx.Pump();
+                    WaitForActionExecutor();
+                    Log("EnterRoom: forced MapRoom transition");
+                }
+                catch (Exception ex)
+                {
+                    Log($"EnterRoom: ForceToMap failed: {ex.Message}");
+                }
+            }
+
             AbstractRoom room;
             switch (roomType.ToLowerInvariant())
             {
@@ -442,9 +464,7 @@ public class RunSimulator
                     return Error($"Unknown room type: {roomType}");
             }
 
-            RunManager.Instance.EnterRoom(room).GetAwaiter().GetResult();
-            _syncCtx.Pump();
-            WaitForActionExecutor();
+            PumpUntilCompleted(RunManager.Instance.EnterRoom(room));
             return DetectDecisionPoint();
         }
         catch (Exception ex) { return ErrorWithTrace("EnterRoom failed", ex); }
@@ -2878,6 +2898,29 @@ public class RunSimulator
     #endregion
 
     #region Helpers
+
+    /// <summary>
+    /// Pump the sync context while waiting for a Task to complete, avoiding deadlock
+    /// from blocking on .GetResult() while the sync context needs the main thread.
+    /// </summary>
+    private void PumpUntilCompleted(Task task, int timeoutMs = 30000)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!task.IsCompleted)
+        {
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            if (task.IsCompleted) break;
+            if (sw.ElapsedMilliseconds > timeoutMs)
+            {
+                Log($"PumpUntilCompleted timed out after {timeoutMs}ms");
+                return;
+            }
+            Thread.Sleep(1);
+        }
+        if (task.IsFaulted)
+            Log($"PumpUntilCompleted task faulted: {task.Exception?.InnerException?.Message}");
+    }
 
     private void WaitForActionExecutor()
     {
