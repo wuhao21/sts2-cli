@@ -398,7 +398,14 @@ public class RunSimulator
                         var id = rEl.GetString();
                         if (id == null) continue;
                         var model = ModelDb.GetById<RelicModel>(new ModelId("RELIC", id));
-                        if (model != null) list.Add(model.ToMutable());
+                        if (model != null)
+                        {
+                            var mutable = model.ToMutable();
+                            RelicCmd.Obtain(mutable, player).GetAwaiter().GetResult();
+                            _syncCtx.Pump();
+                            WaitForActionExecutor();
+                            _syncCtx.Pump();
+                        }
                     }
                 }
             }
@@ -1083,7 +1090,7 @@ public class RunSimulator
         // All other target types (None, All, etc.) → leave target as null
 
         // Check if card can be played
-        if (!card.CanPlay(out var reason, out var _))
+        if (!CanPlaySimple(card, player.PlayerCombatState, out var reason))
         {
             return Error($"Cannot play card {card.GetType().Name}: {reason}");
         }
@@ -2261,7 +2268,7 @@ public class RunSimulator
                 ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
                 ["type"] = c.Type.ToString(),
                 ["rarity"] = c.Rarity.ToString(),
-                ["can_play"] = c.CanPlay(out _, out _),
+                ["can_play"] = CanPlaySimple(c, pcs, out _),
                 ["target_type"] = c.TargetType.ToString(),
                 ["stats"] = stats.Count > 0 ? stats : null,
                 ["description"] = _loc.Bilingual("cards", c.Id.Entry + ".description"),
@@ -2383,6 +2390,28 @@ public class RunSimulator
             ["discard_pile_count"] = pcs?.DiscardPile?.Cards?.Count ?? 0,
         };
 
+        var drawPile = SerializeCombatPile(GetCombatPile(pcs, "DrawPile"));
+        var discardPile = SerializeCombatPile(GetCombatPile(pcs, "DiscardPile"));
+        var exhaustPile = SerializeCombatPile(GetCombatPile(pcs, "ExhaustPile", "ExhaustedPile", "ExilePile", "_exhaustPile", "_exhaustedPile"));
+
+        if (drawPile != null)
+        {
+            result["draw_pile"] = drawPile;
+            result["draw_pile_count"] = drawPile.Count;
+        }
+        if (discardPile != null)
+        {
+            result["discard_pile"] = discardPile;
+            result["discard_pile_count"] = discardPile.Count;
+        }
+        if (exhaustPile != null)
+        {
+            result["exhaust_pile"] = exhaustPile;
+            result["exhaust_pile_count"] = exhaustPile.Count;
+        }
+
+        result["choices"] = BuildCombatChoices(player, enemies);
+
         // Character-specific mechanics
         try
         {
@@ -2431,6 +2460,136 @@ public class RunSimulator
         }
 
         return result;
+    }
+
+    private List<Dictionary<string, object?>> BuildCombatChoices(
+        Player player,
+        List<Dictionary<string, object?>> enemies)
+    {
+        var choices = new List<Dictionary<string, object?>>();
+        var pcs = player.PlayerCombatState;
+        if (pcs == null)
+            return choices;
+
+        var aliveTargets = enemies
+            .Select((enemy, targetIndex) => new
+            {
+                Index = targetIndex,
+                Name = enemy.TryGetValue("name", out var nameObj) ? nameObj?.ToString() ?? $"enemy_{targetIndex}" : $"enemy_{targetIndex}",
+            })
+            .ToList();
+
+        void AddChoice(string action, Dictionary<string, object?> args, string label, string kind, int? cardIndex = null, int? potionIndex = null, int? targetIndex = null)
+        {
+            var choice = new Dictionary<string, object?>
+            {
+                ["action"] = action,
+                ["args"] = args,
+                ["label"] = label,
+                ["kind"] = kind,
+            };
+            if (cardIndex.HasValue) choice["card_index"] = cardIndex.Value;
+            if (potionIndex.HasValue) choice["potion_index"] = potionIndex.Value;
+            if (targetIndex.HasValue) choice["target_index"] = targetIndex.Value;
+            choices.Add(choice);
+        }
+
+        // Flat list of executable combat actions.
+        foreach (var (card, cardIndex) in pcs.Hand.Cards.Select((c, i) => (c, i)))
+        {
+            if (card == null)
+                continue;
+
+            if (!CanPlaySimple(card, pcs, out _))
+                continue;
+
+            var cardName = _loc.Card(card.Id.Entry);
+            var targetType = card.TargetType;
+
+            if (targetType == TargetType.AnyEnemy)
+            {
+                foreach (var target in aliveTargets)
+                {
+                    AddChoice(
+                        "play_card",
+                        new Dictionary<string, object?>
+                        {
+                            ["card_index"] = cardIndex,
+                            ["target_index"] = target.Index,
+                        },
+                        $"Play {cardName} -> {target.Name}",
+                        "card",
+                        cardIndex: cardIndex,
+                        targetIndex: target.Index);
+                }
+                continue;
+            }
+
+            AddChoice(
+                "play_card",
+                new Dictionary<string, object?>
+                {
+                    ["card_index"] = cardIndex,
+                },
+                $"Play {cardName}",
+                "card",
+                cardIndex: cardIndex);
+        }
+
+        var potions = player.Potions?.Select((p, i) => (Potion: p, Index: i)).Where(x => x.Potion != null).ToList() ?? new();
+        foreach (var (potion, potionIndex) in potions)
+        {
+            var potionName = _loc.Potion(potion!.Id.Entry);
+            var targetType = potion.TargetType;
+
+            if (targetType == TargetType.AnyEnemy)
+            {
+                foreach (var target in aliveTargets)
+                {
+                    AddChoice(
+                        "use_potion",
+                        new Dictionary<string, object?>
+                        {
+                            ["potion_index"] = potionIndex,
+                            ["target_index"] = target.Index,
+                        },
+                        $"Use {potionName} -> {target.Name}",
+                        "potion",
+                        potionIndex: potionIndex,
+                        targetIndex: target.Index);
+                }
+            }
+            else
+            {
+                AddChoice(
+                    "use_potion",
+                    new Dictionary<string, object?>
+                    {
+                        ["potion_index"] = potionIndex,
+                    },
+                    $"Use {potionName}",
+                    "potion",
+                    potionIndex: potionIndex);
+            }
+
+            AddChoice(
+                "discard_potion",
+                new Dictionary<string, object?>
+                {
+                    ["potion_index"] = potionIndex,
+                },
+                $"Discard {potionName}",
+                "potion",
+                potionIndex: potionIndex);
+        }
+
+        AddChoice(
+            "end_turn",
+            new Dictionary<string, object?>(),
+            "End turn",
+            "system");
+
+        return choices;
     }
 
     private Dictionary<string, object?> DetectPostCombatState(Player player, CombatRoom combatRoom)
@@ -3072,6 +3231,370 @@ public class RunSimulator
         catch { return null; }
     }
 
+    public Dictionary<string, object?> GetCards()
+    {
+        try
+        {
+            EnsureModelDbInitialized();
+
+            var cards = MegaCrit.Sts2.Core.Models.ModelDb.AllCards
+                .Select(BuildCardSummary)
+                .ToList();
+
+            return new Dictionary<string, object?>
+            {
+                ["type"] = "cards_result",
+                ["count"] = cards.Count,
+                ["cards"] = cards,
+            };
+        }
+        catch (Exception ex)
+        {
+            return ErrorWithTrace("GetCards failed", ex);
+        }
+    }
+
+    public Dictionary<string, object?> GetPowers()
+    {
+        try
+        {
+            EnsureModelDbInitialized();
+
+            var modelDbType = typeof(ModelDb);
+            var candidates = modelDbType
+                .GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+                .Where(p => p.Name.Contains("Power", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(p => p.Name)
+                .ToList();
+
+            var list = new List<object?>();
+            foreach (var prop in candidates)
+            {
+                try
+                {
+                    var value = prop.GetValue(null);
+                    if (value is not System.Collections.IEnumerable enumerable)
+                        continue;
+
+                    foreach (var item in enumerable)
+                    {
+                        if (item == null) continue;
+                        var summary = BuildPowerSummary(item);
+                        if (summary != null)
+                            list.Add(summary);
+                    }
+                }
+                catch { }
+            }
+
+            return new Dictionary<string, object?>
+            {
+                ["type"] = "powers_result",
+                ["count"] = list.Count,
+                ["powers"] = list,
+                ["source_properties"] = candidates.Select(p => p.Name).ToList(),
+            };
+        }
+        catch (Exception ex)
+        {
+            return ErrorWithTrace("GetPowers failed", ex);
+        }
+    }
+
+    public Dictionary<string, object?> GetMonsters()
+    {
+        try
+        {
+            EnsureModelDbInitialized();
+
+            var modelDbType = typeof(ModelDb);
+            var candidates = modelDbType
+                .GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+                .Where(p => p.Name.Contains("Monster", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(p => p.Name)
+                .ToList();
+
+            var list = new List<object?>();
+            foreach (var prop in candidates)
+            {
+                try
+                {
+                    var value = prop.GetValue(null);
+                    if (value is not System.Collections.IEnumerable enumerable)
+                        continue;
+
+                    foreach (var item in enumerable)
+                    {
+                        if (item == null) continue;
+                        var summary = BuildMonsterSummary(item);
+                        if (summary != null)
+                            list.Add(summary);
+                    }
+                }
+                catch { }
+            }
+
+            return new Dictionary<string, object?>
+            {
+                ["type"] = "monsters_result",
+                ["count"] = list.Count,
+                ["monsters"] = list,
+                ["source_properties"] = candidates.Select(p => p.Name).ToList(),
+            };
+        }
+        catch (Exception ex)
+        {
+            return ErrorWithTrace("GetMonsters failed", ex);
+        }
+    }
+
+    private Dictionary<string, object?> BuildCardSummary(CardModel card)
+    {
+        var stats = new Dictionary<string, object?>();
+        try { foreach (var dv in card.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
+
+        var kws = card.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
+        var info = new Dictionary<string, object?>
+        {
+            ["id"] = card.Id.ToString(),
+            ["name"] = _loc.Card(card.Id.Entry),
+            ["cost"] = card.EnergyCost?.GetResolved() ?? 0,
+            ["type"] = card.Type.ToString(),
+            ["rarity"] = card.Rarity.ToString(),
+            ["target_type"] = card.TargetType.ToString(),
+            ["stats"] = stats.Count > 0 ? stats : null,
+            ["description"] = _loc.Bilingual("cards", card.Id.Entry + ".description"),
+            ["after_upgrade"] = GetUpgradedInfo(card),
+        };
+
+        if (kws?.Count > 0)
+            info["keywords"] = kws;
+
+        return info;
+    }
+
+    private Dictionary<string, object?>? BuildPowerSummary(object power)
+    {
+        try
+        {
+            dynamic p = power;
+
+            string? idEntry = null;
+            try { idEntry = p.Id.Entry; } catch { }
+
+            var stats = new Dictionary<string, object?>();
+            try
+            {
+                foreach (var dv in p.DynamicVars.Values)
+                    stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue;
+            }
+            catch { }
+
+            string? description = null;
+            try { description = _loc.Bilingual("powers", idEntry + ".description"); } catch { }
+
+            var info = new Dictionary<string, object?>
+            {
+                ["id"] = idEntry ?? power.GetType().Name,
+                ["name"] = idEntry != null ? _loc.Power(idEntry) : power.GetType().Name,
+                ["description"] = description,
+                ["stats"] = stats.Count > 0 ? stats : null,
+                ["type"] = power.GetType().Name,
+            };
+
+            return info;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private Dictionary<string, object?>? BuildMonsterSummary(object monster)
+    {
+        try
+        {
+            dynamic m = monster;
+
+            string? idEntry = null;
+            try { idEntry = m.Id.Entry; } catch { }
+
+            string? title = null;
+            try { title = m.Title?.ToString(); } catch { }
+
+            var info = new Dictionary<string, object?>
+            {
+                ["id"] = idEntry ?? monster.GetType().Name,
+                ["name"] = idEntry != null ? _loc.Monster(idEntry) : title,
+                ["title"] = title,
+                ["min_hp"] = SafeMonsterInt(m, "MinInitialHp"),
+                ["max_hp"] = SafeMonsterInt(m, "MaxInitialHp"),
+                ["type"] = monster.GetType().Name,
+            };
+
+            return info;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static object? GetCombatPile(object? pcs, params string[] names)
+    {
+        if (pcs == null) return null;
+
+        foreach (var name in names)
+        {
+            try
+            {
+                var prop = pcs.GetType().GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (prop != null)
+                {
+                    var value = prop.GetValue(pcs);
+                    if (value != null) return value;
+                }
+            }
+            catch { }
+
+            try
+            {
+                var field = pcs.GetType().GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (field != null)
+                {
+                    var value = field.GetValue(pcs);
+                    if (value != null) return value;
+                }
+            }
+            catch { }
+        }
+
+        return null;
+    }
+
+    private static List<CardModel>? GetPileCards(object? pile)
+    {
+        if (pile == null) return null;
+        try
+        {
+            if (pile is IEnumerable<CardModel> direct)
+                return direct.Where(c => c != null).ToList();
+        }
+        catch { }
+
+        try
+        {
+            var cardsProp = pile.GetType().GetProperty("Cards", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (cardsProp?.GetValue(pile) is IEnumerable<CardModel> cards)
+                return cards.Where(c => c != null).ToList();
+        }
+        catch { }
+
+        try
+        {
+            var backing = GetBackingList<CardModel>(pile, "_cards");
+            if (backing != null)
+                return backing.Where(c => c != null).ToList();
+        }
+        catch { }
+
+        return null;
+    }
+
+    private List<Dictionary<string, object?>>? SerializeCombatPile(object? pile)
+    {
+        var cards = GetPileCards(pile);
+        if (cards == null) return null;
+
+        return cards.Select((c, i) =>
+        {
+            var stats = new Dictionary<string, object?>();
+            try { foreach (var dv in c.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
+            var kws = c.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
+            var cardInfo = new Dictionary<string, object?>
+            {
+                ["index"] = i,
+                ["id"] = c.Id.ToString(),
+                ["name"] = _loc.Card(c.Id.Entry),
+                ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
+                ["type"] = c.Type.ToString(),
+                ["rarity"] = c.Rarity.ToString(),
+                ["upgraded"] = c.IsUpgraded,
+                ["description"] = _loc.Bilingual("cards", c.Id.Entry + ".description"),
+                ["stats"] = stats.Count > 0 ? stats : null,
+                ["keywords"] = kws?.Count > 0 ? kws : null,
+                ["after_upgrade"] = GetUpgradedInfo(c),
+            };
+            if (c.Enchantment != null)
+            {
+                cardInfo["enchantment"] = _loc.Bilingual("enchantments", c.Enchantment.Id.Entry + ".title");
+                try { if (c.Enchantment.Amount != 0) cardInfo["enchantment_amount"] = c.Enchantment.Amount; } catch { }
+            }
+            if (c.Affliction != null)
+            {
+                cardInfo["affliction"] = _loc.Bilingual("afflictions", c.Affliction.Id.Entry + ".title");
+                try { if (c.Affliction.Amount != 0) cardInfo["affliction_amount"] = c.Affliction.Amount; } catch { }
+            }
+            return cardInfo;
+        }).ToList();
+    }
+
+    private static bool CanPlaySimple(CardModel card, PlayerCombatState? pcs, out string? reason)
+    {
+        reason = null;
+        try
+        {
+            var energy = pcs?.Energy ?? 0;
+
+            if (card.EnergyCost?.CostsX == true)
+            {
+                if (energy <= 0)
+                {
+                    reason = "requires energy for X-cost";
+                    return false;
+                }
+                return true;
+            }
+
+            var cost = card.EnergyCost?.GetResolved() ?? 0;
+            if (cost > energy)
+            {
+                reason = $"requires {cost} energy";
+                return false;
+            }
+
+            // Known special-case blocker that we do want to preserve explicitly.
+            if (card.Id.Entry == "ERADICATE" && energy <= 0)
+            {
+                reason = "requires at least 1 energy";
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            reason = $"playability check failed: {ex.Message}";
+            return false;
+        }
+    }
+
+    private static int? SafeMonsterInt(object monster, string propertyName)
+    {
+        try
+        {
+            var prop = monster.GetType().GetProperty(propertyName);
+            var value = prop?.GetValue(monster);
+            if (value is null) return null;
+            if (value is int i) return i;
+            return Convert.ToInt32(value);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private Dictionary<string, object?> PlayerSummary(Player player)
     {
         return new Dictionary<string, object?>
@@ -3195,6 +3718,16 @@ public class RunSimulator
         {
             Console.Error.WriteLine($"[WARN] PlatformUtil init: {ex.Message}");
         }
+
+        // Initialize ModManager (must run before anything that checks ModManager.State)
+        var modSettings = new MegaCrit.Sts2.Core.Modding.ModSettings
+        {
+            PlayerAgreedToModLoading = false,
+            ModList = new System.Collections.Generic.List<MegaCrit.Sts2.Core.Modding.SettingsSaveMod>()
+        };
+        var version = new MegaCrit.Sts2.Core.Debug.SemanticVersion(0, 0, 0, null, null);
+        MegaCrit.Sts2.Core.Modding.ModManager.Initialize(null, modSettings, version);
+        Console.Error.WriteLine("[INFO] ModManager initialized");
 
         // Initialize SaveManager with a dummy profile for save/load support
         try { SaveManager.Instance.InitProfileId(0); }

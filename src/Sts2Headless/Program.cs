@@ -162,6 +162,15 @@ class Program
             case "get_map":
                 return sim.GetFullMap();
 
+            case "get_cards":
+                return sim.GetCards();
+
+            case "get_powers":
+                return sim.GetPowers();
+
+            case "get_monsters":
+                return sim.GetMonsters();
+
             case "set_player":
             {
                 var args = new Dictionary<string, JsonElement>();
