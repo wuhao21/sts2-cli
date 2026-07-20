@@ -65,10 +65,21 @@ dotnet run --project src/Sts2Headless/Sts2Headless.csproj
 {"cmd": "action", "action": "end_turn"}
 {"cmd": "action", "action": "select_map_node", "args": {"col": 3, "row": 1}}
 {"cmd": "action", "action": "skip_card_reward"}
+{"cmd": "get_cards"}
+{"cmd": "get_powers"}
+{"cmd": "get_monsters"}
 {"cmd": "quit"}
 ```
 
 Each command returns a JSON decision point (`map_select` / `combat_play` / `card_reward` / `rest_site` / `event_choice` / `shop` / `game_over`). All names are in English.
+
+`combat_play` responses also include a flat `choices` array of valid actions for the current combat state, so a client can choose directly from engine-approved moves instead of rebuilding legality from the board state.
+
+`get_cards` returns the full runtime card catalog from the DLL in the same summary style used elsewhere in the CLI: `id`, `name`, `cost`, `type`, `rarity`, `target_type`, `stats`, `description`, `keywords`, and `after_upgrade`.
+
+`get_powers` returns the runtime power catalog the bridge can discover from the DLL, with `id`, `name`, `description`, `stats`, and the underlying runtime type name.
+
+`get_monsters` returns the runtime monster catalog the bridge can discover from the DLL, with `id`, `name`, `title`, `min_hp`, `max_hp`, and the underlying runtime type name.
 
 ## Game Logs
 

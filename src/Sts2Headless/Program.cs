@@ -118,7 +118,8 @@ class Program
                     cmd.TryGetProperty("character", out var ch) ? ch.GetString() ?? "Ironclad" : "Ironclad",
                     cmd.TryGetProperty("ascension", out var asc) ? asc.GetInt32() : 0,
                     cmd.TryGetProperty("seed", out var s) ? s.GetString() : null,
-                    cmd.TryGetProperty("lang", out var lang) ? lang.GetString() ?? "en" : "en"
+                    cmd.TryGetProperty("lang", out var lang) ? lang.GetString() ?? "en" : "en",
+                    cmd.TryGetProperty("neow", out var neow) ? neow.GetBoolean() : true
                 );
 
             case "action":
@@ -161,6 +162,15 @@ class Program
             case "get_map":
                 return sim.GetFullMap();
 
+            case "get_cards":
+                return sim.GetCards();
+
+            case "get_powers":
+                return sim.GetPowers();
+
+            case "get_monsters":
+                return sim.GetMonsters();
+
             case "set_player":
             {
                 var args = new Dictionary<string, JsonElement>();
@@ -175,6 +185,30 @@ class Program
                 var encounter = cmd.TryGetProperty("encounter", out var enc) ? enc.GetString() : null;
                 var eventId = cmd.TryGetProperty("event", out var ev) ? ev.GetString() : null;
                 return sim.EnterRoom(roomType, encounter, eventId);
+            }
+
+            case "setup_combat":
+            {
+                var scCharacter = cmd.TryGetProperty("character", out var scCh) ? scCh.GetString() ?? "Ironclad" : "Ironclad";
+                var scEncounter = cmd.TryGetProperty("encounter", out var scEnc) ? scEnc.GetString() ?? "SHRINKER_BEETLE_WEAK" : "SHRINKER_BEETLE_WEAK";
+                var scAscension = cmd.TryGetProperty("ascension", out var scAsc) ? scAsc.GetInt32() : 10;
+                var scSeed = cmd.TryGetProperty("seed", out var scSd) ? scSd.GetString() : null;
+                var scHp = cmd.TryGetProperty("hp", out var scHpEl) ? scHpEl.GetInt32() : 80;
+                var scMaxHp = cmd.TryGetProperty("max_hp", out var scMhpEl) ? scMhpEl.GetInt32() : 80;
+                var scGold = cmd.TryGetProperty("gold", out var scGEl) ? scGEl.GetInt32() : 99;
+                var scLang = cmd.TryGetProperty("lang", out var scLa) ? scLa.GetString() ?? "en" : "en";
+
+                var scRelics = new List<string>();
+                if (cmd.TryGetProperty("relics", out var scRelicsArr))
+                    foreach (var r in scRelicsArr.EnumerateArray())
+                        scRelics.Add(r.GetString() ?? "");
+
+                var scDeck = new List<string>();
+                if (cmd.TryGetProperty("deck", out var scDeckArr))
+                    foreach (var d in scDeckArr.EnumerateArray())
+                        scDeck.Add(d.GetString() ?? "");
+
+                return sim.SetupCombat(scCharacter, scEncounter, scAscension, scSeed, scHp, scMaxHp, scGold, scRelics, scDeck, scLang);
             }
 
             case "set_draw_order":
