@@ -517,7 +517,8 @@ public class RunSimulator
             Log($"RunState created, players={_runState.Players?.Count}");
 
             var netService = new NetSingleplayerGameService();
-            RunManager.Instance.SetUpSavedSinglePlayer(_runState, save);
+            // Renamed in v0.107.1: "Singleplayer", not "SinglePlayer".
+            _ = RunManager.Instance.SetUpSavedSingleplayer(_runState, save);
             LocalContext.NetId = netService.NetId;
 
             CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
@@ -3073,6 +3074,23 @@ public class RunSimulator
         _modelDbInitialized = true;
 
         TestMode.IsOn = true;
+
+        // v0.107.1: RunState.CreateForTest now reaches ModelDb.BadgeModels, which
+        // calls ReflectionHelper.ModTypes and throws "ModManager is not finished
+        // initializing!" while ModManager.State is None. ResetForTests() clears the
+        // mod list but leaves State at None, so set it to Skipped — "finished, with
+        // no mods", which is accurate headless. Without this every start_run fails.
+        try
+        {
+            MegaCrit.Sts2.Core.Modding.ModManager.ResetForTests();
+            typeof(MegaCrit.Sts2.Core.Modding.ModManager)
+                .GetProperty("State", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                ?.SetValue(null, MegaCrit.Sts2.Core.Modding.ModManagerState.Skipped);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] ModManager init: {ex.Message}");
+        }
 
         // Install inline sync context on main thread
         SynchronizationContext.SetSynchronizationContext(_syncCtx);
