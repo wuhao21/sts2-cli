@@ -517,7 +517,7 @@ public class RunSimulator
             Log($"RunState created, players={_runState.Players?.Count}");
 
             var netService = new NetSingleplayerGameService();
-            RunManager.Instance.SetUpSavedSinglePlayer(_runState, save);
+            RunManager.Instance.SetUpSavedSingleplayer(_runState, save);
             LocalContext.NetId = netService.NetId;
 
             CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
@@ -3073,6 +3073,7 @@ public class RunSimulator
         _modelDbInitialized = true;
 
         TestMode.IsOn = true;
+        InitializeEmptyModTypeCache();
 
         // Install inline sync context on main thread
         SynchronizationContext.SetSynchronizationContext(_syncCtx);
@@ -3148,6 +3149,34 @@ public class RunSimulator
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[WARN] ModelIdSerializationCache.Init: {ex.Message}");
+        }
+    }
+
+    private static void InitializeEmptyModTypeCache()
+    {
+        try
+        {
+            var helperType = typeof(ModelDb).Assembly.GetType("MegaCrit.Sts2.Core.Helpers.ReflectionHelper");
+            var getter = helperType?.GetProperty("ModTypes", BindingFlags.Static | BindingFlags.Public)?.GetGetMethod();
+            var prefix = typeof(YieldPatches).GetMethod(nameof(YieldPatches.ReflectionHelperModTypesPrefix),
+                BindingFlags.Static | BindingFlags.Public);
+            if (getter != null && prefix != null)
+            {
+                var harmony = new Harmony("sts2headless.modtypes");
+                harmony.Patch(getter, new HarmonyMethod(prefix));
+                Console.Error.WriteLine("[INFO] Patched ReflectionHelper.ModTypes to empty for headless");
+            }
+
+            var modTypesField = helperType?.GetField("_modTypes", BindingFlags.Static | BindingFlags.NonPublic);
+            if (modTypesField != null && modTypesField.GetValue(null) == null)
+            {
+                modTypesField.SetValue(null, Type.EmptyTypes);
+                Console.Error.WriteLine("[INFO] ReflectionHelper.ModTypes initialized empty for headless");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] ReflectionHelper.ModTypes init: {ex.Message}");
         }
     }
 
@@ -3442,6 +3471,12 @@ public class RunSimulator
         {
             __result = null;
             return false; // Skip original method
+        }
+
+        public static bool ReflectionHelperModTypesPrefix(ref Type[] __result)
+        {
+            __result = Type.EmptyTypes;
+            return false; // Skip ModManager initialization guard in no-mods headless mode.
         }
     }
 
