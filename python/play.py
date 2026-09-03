@@ -17,6 +17,20 @@ import argparse
 import random
 from game_log import GameLogger
 
+
+def _configure_stdio():
+    """Keep Windows code pages from crashing on emoji/CJK output."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+_configure_stdio()
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT = os.path.join(ROOT, "src", "Sts2Headless", "Sts2Headless.csproj")
 LIB_DIR = os.path.join(ROOT, "lib")
@@ -26,11 +40,14 @@ SAVE_DIR = os.path.join(ROOT, "saves")
 def _find_dotnet():
     """Find .NET SDK binary."""
     candidates = [
+        os.environ.get("DOTNET"),
         os.path.expanduser("~/.dotnet-arm64/dotnet"),
         os.path.expanduser("~/.dotnet/dotnet"),
         "dotnet",
     ]
     for p in candidates:
+        if not p:
+            continue
         try:
             r = subprocess.run([p, "--version"], capture_output=True, text=True, timeout=5)
             if r.returncode == 0:

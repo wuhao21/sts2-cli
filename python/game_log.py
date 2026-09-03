@@ -50,7 +50,7 @@ class GameLogger:
         safe_seed = str(seed).replace("/", "_")
         filename = f"{ts}_{character}_{safe_seed}.jsonl"
         self._path = os.path.join(LOG_DIR, filename)
-        self._file = open(self._path, "w")
+        self._file = open(self._path, "w", encoding="utf-8")
 
     def log_state(self, state: dict):
         """Log a state/decision point received from the simulator."""
