@@ -215,8 +215,9 @@ public class RunSimulator
     private readonly ManualResetEventSlim _turnStarted = new(false);
     private readonly ManualResetEventSlim _combatEnded = new(false);
     private static readonly LocLookup _loc = new();
-    private bool _eventOptionChosen;
-    private int _lastEventOptionCount;
+    // Event choices run outside ActionExecutor and may pause for external selections.
+    // Keep their task until the whole continuation finishes, not just the first prompt.
+    private Task? _pendingEventOptionTask;
 
     // Pending rewards for card selection (populated after combat, before proceeding)
     private List<Reward>? _pendingRewards;
@@ -923,8 +924,6 @@ public class RunSimulator
         // Reset tracking for new room
         _rewardsProcessed = false;
         _pendingCardReward = null;
-        _eventOptionChosen = false;
-        _lastEventOptionCount = 0;
         _pendingRewards = null;
         _lastKnownHp = player.Creature?.CurrentHp ?? 0;
 
@@ -1635,37 +1634,21 @@ public class RunSimulator
         // Run Chosen() on a background thread so card selections can pause
         else if (_runState?.CurrentRoom is EventRoom)
         {
+            // A stale client choice must not start another option while the previous
+            // option is still awaiting a selection or finishing its effects.
+            if (_pendingEventOptionTask != null)
+                return DetectDecisionPoint();
+
             var eventSync = RunManager.Instance.EventSynchronizer;
             var localEvent = eventSync?.GetLocalEvent();
             if (localEvent != null && !localEvent.IsFinished)
             {
                 var options = localEvent.CurrentOptions;
-                var optCountBefore = options?.Count ?? 0;
                 if (options != null && optionIndex >= 0 && optionIndex < options.Count)
                 {
-                    try
-                    {
-                        _eventOptionChosen = true;
-                        _lastEventOptionCount = options.Count;
-                        // Run on thread pool so GetSelectedCards/GetSelectedCardReward can block
-                        var task = Task.Run(() => options[optionIndex].Chosen());
-                        for (int i = 0; i < 100; i++)
-                        {
-                            _syncCtx.Pump();
-                            if (_cardSelector.HasPending || _cardSelector.HasPendingReward) break;
-                            if (_pendingBundles != null) break;
-                            if (task.IsCompleted) break;
-                            Thread.Sleep(10);
-                        }
-                        if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
-                        {
-                            WaitForActionExecutor();
-                            return DetectDecisionPoint();
-                        }
-                        if (!task.IsCompleted) task.Wait(2000);
-                        _syncCtx.Pump();
-                    }
-                    catch (Exception ex) { Log($"Event choose: {ex.Message}"); }
+                    // DetectDecisionPoint waits for completion or the next external prompt.
+                    // The task remains tracked across select_cards / rewards / bundles.
+                    _pendingEventOptionTask = Task.Run(() => options[optionIndex].Chosen());
                 }
 
                 // Note: do NOT force-finish on `optCountAfter == optCountBefore`. Events can
@@ -1769,6 +1752,8 @@ public class RunSimulator
     {
         if (_runState == null)
             return Error("No run in progress");
+
+        WaitForEventOption();
 
         var player = _runState.Players[0];
 
@@ -2486,12 +2471,6 @@ public class RunSimulator
         var localEvent = RunManager.Instance.EventSynchronizer?.GetLocalEvent();
         _syncCtx.Pump();
 
-        // Reset the choice-tracking flag once we re-export the event state. Earlier this
-        // block force-finished events whose option count was unchanged, but that incorrectly
-        // killed legitimate loops like Slippery Bridge Hold On (#59). Rely on IsFinished
-        // instead and let DetectDecisionPoint show the current options for the next choice.
-        if (_eventOptionChosen) _eventOptionChosen = false;
-
         // If event is finished, proceed to map
         if (localEvent == null || localEvent.IsFinished)
         {
@@ -2878,6 +2857,30 @@ public class RunSimulator
     #endregion
 
     #region Helpers
+
+    private void WaitForEventOption()
+    {
+        var task = _pendingEventOptionTask;
+        if (task == null) return;
+
+        var deadline = Environment.TickCount64 + 3000;
+        while (!task.IsCompleted)
+        {
+            _syncCtx.Pump();
+            if (task.IsCompleted) break;
+            if (_cardSelector.HasPending || _cardSelector.HasPendingReward ||
+                (_pendingBundles != null && _pendingBundleTcs != null && !_pendingBundleTcs.Task.IsCompleted))
+                return;
+            if (Environment.TickCount64 >= deadline)
+                throw new TimeoutException("Event option did not finish or reach a selection within 3 seconds");
+            Thread.Sleep(1);
+        }
+
+        _pendingEventOptionTask = null;
+        // Surface failed continuations instead of silently re-exporting old options.
+        task.GetAwaiter().GetResult();
+        _syncCtx.Pump();
+    }
 
     private void WaitForActionExecutor()
     {
@@ -3357,9 +3360,12 @@ public class RunSimulator
 
         public void ResolvePending(IEnumerable<CardModel> selected)
         {
-            _pendingTcs?.TrySetResult(selected);
+            var tcs = _pendingTcs;
             PendingOptions = null;
             _pendingTcs = null;
+            // Completing the task can immediately open another selection. Clear the
+            // old prompt first so we cannot erase that new prompt on return.
+            tcs?.TrySetResult(selected);
         }
 
         public void ResolvePendingByIndices(int[] indices)
@@ -3374,9 +3380,7 @@ public class RunSimulator
 
         public void CancelPending()
         {
-            _pendingTcs?.TrySetResult(Array.Empty<CardModel>());
-            PendingOptions = null;
-            _pendingTcs = null;
+            ResolvePending(Array.Empty<CardModel>());
         }
 
         // Pending card reward from events (GetSelectedCardReward blocks until resolved)
@@ -3411,7 +3415,7 @@ public class RunSimulator
             return default;  // Skip (card=null, alternative=null)
         }
 
-        public bool HasPendingReward => PendingRewardCards != null && _rewardWait != null;
+        public bool HasPendingReward => PendingRewardCards != null && _rewardWait is { IsSet: false };
 
         public void ResolveReward(int index)
         {
