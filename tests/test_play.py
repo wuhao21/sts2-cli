@@ -7,6 +7,8 @@ import pathlib
 import sys
 import os
 import subprocess
+import io
+import json
 
 import pytest
 
@@ -58,3 +60,35 @@ def test_setup_repairs_missing_module_dependency(monkeypatch):
     play.ensure_setup()
     assert calls == [(["bash", os.path.join(play.ROOT, "setup.sh"), "/test/steam/data"],
                       {"cwd": play.ROOT, "check": True})]
+
+
+def test_interactive_timeout_stops_without_proceeding_or_declaring_death(monkeypatch, capsys):
+    responses = [
+        {"type": "ready"},
+        {"type": "decision", "decision": "combat_play", "round": 2,
+         "player": {"hp": 57}, "hand": [], "energy": 0, "enemies": []},
+        {"type": "error", "error_code": "combat_turn_timeout", "message": "Turn stalled",
+         "player": {"hp": 52}},
+        {"type": "quit_result"},
+    ]
+    sent = io.StringIO()
+
+    class Process:
+        stdin = sent
+        stdout = io.StringIO("".join(json.dumps(r) + "\n" for r in responses))
+
+        def terminate(self):
+            pass
+
+        def wait(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(play.subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(play, "LANG", "en")
+    monkeypatch.setattr(play, "show_combat", lambda state: None)
+    play.play(seed="timeout", auto=True, log=False)
+
+    commands = [json.loads(line) for line in sent.getvalue().splitlines()]
+    assert [cmd.get("action", cmd["cmd"]) for cmd in commands] == ["start_run", "end_turn", "quit"]
+    output = capsys.readouterr().out
+    assert "Stopping without recording a defeat" in output

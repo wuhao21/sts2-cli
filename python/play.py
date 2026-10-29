@@ -1605,6 +1605,10 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
 
             if state.get("type") == "error":
                 print(f"  {c(t('Error:','错误:'), 'red')} {state.get('message', '?')}")
+                if state.get("error_code") == "combat_turn_timeout":
+                    print(t("Combat stalled. Stopping without recording a defeat; see the game log for details.",
+                            "战斗卡住了，本次运行已停止，未判定为死亡；详情请查看游戏日志。"))
+                    break
                 state = send({"cmd": "action", "action": "proceed"})
                 continue
 

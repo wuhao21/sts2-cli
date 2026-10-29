@@ -79,6 +79,13 @@ dotnet run --project src/Sts2Headless/Sts2Headless.csproj
 
 Each command returns a JSON decision point (`map_select` / `combat_play` / `card_reward` / `rest_site` / `event_choice` / `shop` / `game_over`). All names are in English.
 
+If a combat turn stalls beyond the adapter's bounded wait, the response has
+`type: "error"` and `error_code: "combat_turn_timeout"`, with the current player HP,
+round, and phase. This is an engine error; it does not mark the run as a defeat.
+Stop automatic actions and retain the JSONL and engine stderr logs. While the
+turn is stalled, further actions return the same error. If the engine recovers,
+the first subsequent action returns the recovered decision without executing that action.
+
 ## Game Logs
 
 Every run is automatically logged to `logs/` as a JSONL file (one JSON per line), recording each game state and action with timestamps. Logs older than 7 days are cleaned up automatically.
@@ -202,6 +209,11 @@ dotnet run --project src/Sts2Headless/Sts2Headless.csproj
 ```
 
 每个命令返回一个 JSON decision point（`map_select` / `combat_play` / `card_reward` / `rest_site` / `event_choice` / `shop` / `game_over`），所有名称为英文。
+
+战斗回合结算超时时，接口返回 `type: "error"`、
+`error_code: "combat_turn_timeout"`，并保留当前血量、回合数和阶段。
+这表示引擎异常，不会判定本局死亡。请停止自动操作并保留 JSONL 和引擎 stderr 日志。
+卡住期间，后续操作会继续返回该错误；引擎恢复后，第一次提交的操作只返回恢复后的决策状态，不会执行该操作。
 
 ## 游戏日志
 

@@ -218,6 +218,7 @@ public class RunSimulator
     // Event choices run outside ActionExecutor and may pause for external selections.
     // Keep their task until the whole continuation finishes, not just the first prompt.
     private Task? _pendingEventOptionTask;
+    private bool _combatTurnTimedOut;
 
     // Pending rewards for card selection (populated after combat, before proceeding)
     private List<Reward>? _pendingRewards;
@@ -250,6 +251,7 @@ public class RunSimulator
                 ascensionLevel: ascension,
                 seed: seedStr
             );
+            _combatTurnTimedOut = false;
 
             // Set up RunManager with test mode
             var netService = new NetSingleplayerGameService();
@@ -514,6 +516,7 @@ public class RunSimulator
             _runState = RunState.FromSerializable(save);
             if (_runState == null)
                 return Error("Failed to create RunState from save");
+            _combatTurnTimedOut = false;
 
             Log($"RunState created, players={_runState.Players?.Count}");
 
@@ -868,6 +871,19 @@ public class RunSimulator
 
             var player = _runState.Players[0];
 
+            if (_combatTurnTimedOut)
+            {
+                _syncCtx.Pump();
+                if (CombatManager.Instance.IsInProgress && !IsPlayPhase() &&
+                    !player.Creature.IsDead && !HasPendingSelection)
+                    return CombatTurnTimeoutState(player);
+
+                // Surface recovery before accepting another action. In particular, a
+                // retried end_turn must not end the newly resumed turn a second time.
+                _combatTurnTimedOut = false;
+                return DetectDecisionPoint();
+            }
+
             switch (action)
             {
                 case "select_map_node":
@@ -1053,7 +1069,12 @@ public class RunSimulator
                 Thread.Sleep(100);
                 _syncCtx.Pump();
                 if (!IsPlayPhase())
-                    return DetectDecisionPoint();
+                {
+                    if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead || HasPendingSelection)
+                        return DetectDecisionPoint();
+                    _combatTurnTimedOut = true;
+                    return CombatTurnTimeoutState(player);
+                }
             }
         }
 
@@ -1064,28 +1085,22 @@ public class RunSimulator
         _turnStarted.Reset();
         _combatEnded.Reset();
 
-        // Enable SuppressYield so Task.Yield() runs inline during enemy turn processing.
-        // This prevents deadlocks during boss fights (e.g., Vantom) where continuations
-        // would otherwise be posted to ThreadPool and never complete.
-        // Keep SuppressYield=true through the initial fallback wait loop — multi-hit
-        // attacks (e.g., 10x2) have continuations between hits that also need suppression.
+        // Submit exactly once. Cancelling and resubmitting can leave queued EndTurn
+        // actions that skip an extra turn when the original continuation eventually resumes.
+        // Keep yield suppression on through multi-hit attacks and the bounded wait.
         YieldPatches.SuppressYield = true;
         try
         {
             PlayerCmd.EndTurn(player, canBackOut: false);
-            _syncCtx.Pump();
-
-            // Fallback: if turn didn't complete synchronously, keep pumping with SuppressYield on
-            if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
+            var deadline = Environment.TickCount64 + 5000;
+            while (true)
             {
-                for (int i = 0; i < 50; i++)
-                {
-                    _syncCtx.Pump();
-                    if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-                    if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                    if (IsPlayPhase()) break;
-                    Thread.Sleep(5);
-                }
+                _syncCtx.Pump();
+                if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead || HasPendingSelection)
+                    break;
+                if (_turnStarted.IsSet && IsPlayPhase()) break;
+                if (Environment.TickCount64 >= deadline) break;
+                Thread.Sleep(5);
             }
         }
         finally
@@ -1093,110 +1108,13 @@ public class RunSimulator
             YieldPatches.SuppressYield = false;
         }
 
-        // Second fallback: if still stuck after SuppressYield window, cancel and retry.
-        // The WaitUntilQueue TCS is likely deadlocked.
-        if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
+        // A stalled phase transition is an engine error, not evidence of player death.
+        // Completion/death and external selections still use their normal decision paths.
+        if (CombatManager.Instance.IsInProgress && !IsPlayPhase() &&
+            !player.Creature.IsDead && !HasPendingSelection)
         {
-            Log("EndTurn stuck, cancelling and retrying with SuppressYield...");
-            try
-            {
-                RunManager.Instance.ActionExecutor.Cancel();
-                _syncCtx.Pump();
-                Thread.Sleep(50);
-                _syncCtx.Pump();
-
-                // Reset the player ready state and try again with SuppressYield
-                CombatManager.Instance.UndoReadyToEndTurn(player);
-                _syncCtx.Pump();
-
-                YieldPatches.SuppressYield = true;
-                try
-                {
-                    PlayerCmd.EndTurn(player, canBackOut: false);
-                    _syncCtx.Pump();
-                }
-                finally
-                {
-                    YieldPatches.SuppressYield = false;
-                }
-
-                for (int i = 0; i < 100; i++)
-                {
-                    _syncCtx.Pump();
-                    if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-                    if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                    if (IsPlayPhase()) break;
-                    Thread.Sleep(10);
-                }
-            }
-            catch (Exception ex) { Log($"Cancel retry: {ex.Message}"); }
-
-            // NUCLEAR OPTION: If STILL stuck after 2 attempts, use ThreadPool to force
-            // the enemy turn processing to complete with SuppressYield permanently on.
-            if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
-            {
-                var stuckState = CombatManager.Instance.DebugOnlyGetState();
-                var stuckEnemies = stuckState?.Enemies?.Where(e => e != null && e.IsAlive)
-                    .Select(e => $"{e.Monster?.GetType().Name}(hp={e.CurrentHp})").ToList();
-                Log($"EndTurn STILL stuck after retry — nuclear fallback. Round={stuckState?.RoundNumber}, " +
-                    $"Enemies=[{string.Join(",", stuckEnemies ?? new())}], " +
-                    $"IsPlayPhase={IsPlayPhase()}, " +
-                    $"IsInProgress={CombatManager.Instance.IsInProgress}, " +
-                    $"ActionExecutor.IsRunning={RunManager.Instance.ActionExecutor.IsRunning}");
-                try
-                {
-                    // Cancel again and undo
-                    RunManager.Instance.ActionExecutor.Cancel();
-                    _syncCtx.Pump();
-                    CombatManager.Instance.UndoReadyToEndTurn(player);
-                    _syncCtx.Pump();
-                    Thread.Sleep(50);
-
-                    // Run EndTurn on ThreadPool with SuppressYield permanently on
-                    YieldPatches.SuppressYield = true;
-                    var endTurnTask = Task.Run(() =>
-                    {
-                        PlayerCmd.EndTurn(player, canBackOut: false);
-                    });
-
-                    // Aggressively pump sync context while waiting (up to 5 seconds)
-                    for (int i = 0; i < 500; i++)
-                    {
-                        _syncCtx.Pump();
-                        if (endTurnTask.IsCompleted) break;
-                        if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-                        if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                        if (IsPlayPhase()) break;
-                        Thread.Sleep(10);
-                    }
-                    YieldPatches.SuppressYield = false;
-
-                    // If still not play phase, try just waiting a bit more
-                    if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
-                    {
-                        for (int i = 0; i < 200; i++)
-                        {
-                            _syncCtx.Pump();
-                            Thread.Sleep(10);
-                            if (IsPlayPhase() || !CombatManager.Instance.IsInProgress || player.Creature.IsDead)
-                                break;
-                        }
-                    }
-
-                    if (IsPlayPhase())
-                        Log("Nuclear fallback SUCCEEDED — play phase resumed");
-                    else
-                    {
-                        Log("Nuclear fallback FAILED — forcing game_over to escape deadlock");
-                        return GameOverState(false);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log($"Nuclear fallback error: {ex.Message}");
-                    YieldPatches.SuppressYield = false;
-                }
-            }
+            _combatTurnTimedOut = true;
+            return CombatTurnTimeoutState(player);
         }
 
         return DetectDecisionPoint();
@@ -2858,6 +2776,26 @@ public class RunSimulator
 
     #region Helpers
 
+    private bool HasPendingSelection => _cardSelector.HasPending || _cardSelector.HasPendingReward ||
+        (_pendingBundles != null && _pendingBundleTcs != null && !_pendingBundleTcs.Task.IsCompleted);
+
+    private Dictionary<string, object?> CombatTurnTimeoutState(Player player)
+    {
+        var combat = CombatManager.Instance.DebugOnlyGetState();
+        var response = Error("Combat turn timed out before reaching the next decision. " +
+            "The run has not been marked as a defeat; see stderr for engine diagnostics.");
+        response["error_code"] = "combat_turn_timeout";
+        response["context"] = RunContext();
+        response["player"] = PlayerSummary(player);
+        response["round"] = combat?.RoundNumber;
+        response["player_phase"] = player.PlayerCombatState?.Phase.ToString();
+        response["combat_in_progress"] = CombatManager.Instance.IsInProgress;
+        response["action_executor_running"] = RunManager.Instance.ActionExecutor.IsRunning;
+        Log($"Combat turn timeout: hp={player.Creature.CurrentHp}, round={combat?.RoundNumber}, " +
+            $"phase={player.PlayerCombatState?.Phase}, in_progress={CombatManager.Instance.IsInProgress}");
+        return response;
+    }
+
     private void WaitForEventOption()
     {
         var task = _pendingEventOptionTask;
@@ -3919,6 +3857,7 @@ public class RunSimulator
             if (RunManager.Instance.IsInProgress)
                 RunManager.Instance.CleanUp(graceful: true);
             _runState = null;
+            _combatTurnTimedOut = false;
         }
         catch (Exception ex)
         {

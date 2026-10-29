@@ -206,6 +206,8 @@ def play_run(seed: str, character: str = "Ironclad", verbose: bool = True, log: 
                         })
                         if state.get("type") != "error":
                             break
+                        if state.get("error_code") == "combat_turn_timeout":
+                            break
                         import time
                         time.sleep(0.5)
 
