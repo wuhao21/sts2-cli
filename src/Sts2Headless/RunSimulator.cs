@@ -1201,12 +1201,15 @@ public class RunSimulator
         var entry = allEntries[idx];
         if (!entry.IsStocked) return Error("Card already purchased");
         if (player.Gold < entry.Cost) return Error("Not enough gold");
+        var purchasedName = entry.CreationResult?.Card?.GetType().Name ?? "card";
+        var purchasedCost = entry.Cost;
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
+            if (!entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult())
+                return Error("Card purchase was declined");
             _syncCtx.Pump();
-            Log($"Bought card: {entry.CreationResult?.Card?.GetType().Name ?? "?"} for {entry.Cost}g");
+            Log($"Bought card: {purchasedName} for {purchasedCost}g");
         }
         catch (Exception ex) { return Error($"Buy card failed: {ex.Message}"); }
 
@@ -1227,6 +1230,8 @@ public class RunSimulator
         var entry = entries[idx];
         if (!entry.IsStocked) return Error("Relic already purchased");
         if (player.Gold < entry.Cost) return Error("Not enough gold");
+        var purchasedName = entry.Model.GetType().Name;
+        var purchasedCost = entry.Cost;
 
         try
         {
@@ -1236,6 +1241,7 @@ public class RunSimulator
             // continues once the selector's TCS is fed by select_cards.
             var inv = merchantRoom.GetLocalInventory();
             var task = Task.Run(() => entry.OnTryPurchaseWrapper(inv));
+            _pendingShopPurchase = task;
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -1246,12 +1252,14 @@ public class RunSimulator
             }
             if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
             {
-                Log($"Buy relic {entry.Model.GetType().Name}: yielded for pending selection");
+                Log($"Buy relic {purchasedName}: yielded for pending selection");
                 return DetectDecisionPoint();
             }
-            if (!task.IsCompleted) task.Wait(2000);
+            if (!task.IsCompleted && !task.Wait(2000)) return Error("Relic purchase is still pending; query get_state");
+            var purchaseError = ObserveShopPurchase();
+            if (purchaseError != null) return purchaseError;
             _syncCtx.Pump();
-            Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
+            Log($"Bought relic: {purchasedName} for {purchasedCost}g");
         }
         catch (Exception ex) { return Error($"Buy relic failed: {ex.Message}"); }
 
@@ -1272,17 +1280,19 @@ public class RunSimulator
         var entry = entries[idx];
         if (!entry.IsStocked) return Error("Potion already purchased");
         if (player.Gold < entry.Cost) return Error("Not enough gold");
+        var purchasedName = entry.Model.GetType().Name;
+        var purchasedCost = entry.Cost;
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
+            if (!entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult())
+                return Error("Potion purchase was declined (check potion capacity)");
             _syncCtx.Pump();
-            Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
+            Log($"Bought potion: {purchasedName} for {purchasedCost}g");
         }
         catch (Exception ex)
         {
-            // Potion purchase sometimes NullRefs in headless (missing potion slot UI)
-            Log($"Buy potion failed: {ex.Message}");
+            return ErrorWithTrace("Buy potion failed", ex);
         }
 
         return DetectDecisionPoint();
@@ -1666,8 +1676,21 @@ public class RunSimulator
 
     #region Decision Point Detection
 
+    private Task<bool>? _pendingShopPurchase;
+
+    private Dictionary<string, object?>? ObserveShopPurchase()
+    {
+        if (_pendingShopPurchase?.IsCompleted != true) return null;
+        var task = _pendingShopPurchase;
+        _pendingShopPurchase = null;
+        try { return task.GetAwaiter().GetResult() ? null : Error("Shop purchase was declined"); }
+        catch (Exception ex) { return ErrorWithTrace("Shop purchase failed", ex); }
+    }
+
     private Dictionary<string, object?> DetectDecisionPoint()
     {
+        var purchaseError = ObserveShopPurchase();
+        if (purchaseError != null) return purchaseError;
         if (_runState == null)
             return Error("No run in progress");
 
@@ -2585,6 +2608,9 @@ public class RunSimulator
         };
     }
 
+    private static Dictionary<string, object?> SoldOutSlot(int index) =>
+        new() { ["index"] = index, ["is_stocked"] = false };
+
     private Dictionary<string, object?> ShopState(MerchantRoom merchantRoom, Player player)
     {
         var inv = merchantRoom.GetLocalInventory();
@@ -2593,6 +2619,7 @@ public class RunSimulator
         var cards = inv.CharacterCardEntries.Concat(inv.ColorlessCardEntries)
             .Select((e, i) =>
             {
+                if (!e.IsStocked) return SoldOutSlot(i);
                 var card = e.CreationResult?.Card;
                 var entry = card?.Id.Entry ?? "?";
                 var stats = new Dictionary<string, object?>();
@@ -2634,7 +2661,7 @@ public class RunSimulator
                 };
             }).ToList();
 
-        var relics = inv.RelicEntries.Select((e, i) => new Dictionary<string, object?>
+        var relics = inv.RelicEntries.Select((e, i) => !e.IsStocked ? SoldOutSlot(i) : new Dictionary<string, object?>
         {
             ["index"] = i,
             ["name"] = _loc.Relic(e.Model?.Id.Entry ?? "?"),
@@ -2643,7 +2670,7 @@ public class RunSimulator
             ["is_stocked"] = e.IsStocked,
         }).ToList();
 
-        var potions = inv.PotionEntries.Select((e, i) => new Dictionary<string, object?>
+        var potions = inv.PotionEntries.Select((e, i) => !e.IsStocked ? SoldOutSlot(i) : new Dictionary<string, object?>
         {
             ["index"] = i,
             ["name"] = _loc.Potion(e.Model?.Id.Entry ?? "?"),

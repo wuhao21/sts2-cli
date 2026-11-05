@@ -60,9 +60,12 @@ class TestShopBuy:
         assert stocked
         card = stocked[0]
         state = game.act("buy_card", card_index=card["index"])
-        if state.get("decision") == "shop":
-            assert state["player"]["gold"] < gold_before
-            assert state["player"]["deck_size"] == deck_before + 1
+        assert state.get("decision") == "shop", state
+        assert state["player"]["gold"] == gold_before - card["cost"]
+        assert state["player"]["deck_size"] == deck_before + 1
+        assert state["cards"][card["index"]] == {"index": card["index"], "is_stocked": False}
+        assert game.act("buy_card", card_index=card["index"])["type"] == "error"
+        assert game.set_player()["player"] == state["player"]
 
     def test_buy_insufficient_gold(self, game):
         state = game.start(seed="sb2")
@@ -90,9 +93,31 @@ class TestShopRemove:
         state = game.enter_room("shop")
         deck_before = state["player"]["deck_size"]
         state = game.act("remove_card")
-        # Should trigger card_select
-        if state["decision"] == "card_select":
-            state = game.act("select_cards", indices="0")
-            # Should return to shop with deck_size - 1
-            if state.get("decision") == "shop":
-                assert state["player"]["deck_size"] == deck_before - 1
+        assert state["decision"] == "card_select", state
+        state = game.act("select_cards", indices="0")
+        assert state.get("decision") == "shop", state
+        assert state["player"]["deck_size"] == deck_before - 1
+
+
+def test_full_potion_belt_purchase_is_rejected_without_charge(game):
+    game.skip_neow(game.start(seed='full-potion-belt'))
+    game.set_player(gold=999, potions=['STRENGTH_POTION'] * 5)
+    before = game.enter_room('shop')
+    potion = next(p for p in before['potions'] if p['is_stocked'])
+    result = game.act('buy_potion', potion_index=potion['index'])
+    assert result.get('type') == 'error', result
+    assert game.set_player()["player"] == before["player"]
+
+
+def test_potion_purchase_reports_receipt_and_sold_out_slot(game):
+    game.skip_neow(game.start(seed="potion-receipt"))
+    game.set_player(gold=999, potions=[])
+    before = game.enter_room("shop")
+    potion = next(p for p in before["potions"] if p["is_stocked"])
+    state = game.act("buy_potion", potion_index=potion["index"])
+    assert state["decision"] == "shop", state
+    assert state["player"]["gold"] == before["player"]["gold"] - potion["cost"]
+    assert len(state["player"]["potions"]) == len(before["player"]["potions"]) + 1
+    assert state["potions"][potion["index"]] == {"index": potion["index"], "is_stocked": False}
+    assert game.act("buy_potion", potion_index=potion["index"])["type"] == "error"
+    assert game.set_player()["player"] == state["player"]
