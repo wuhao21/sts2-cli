@@ -12,7 +12,7 @@ Examples:
     # Replay a logged game up to step 42, then continue interactively
     python3 agent/sts2_bridge.py replay /tmp/game.jsonl --until 42 --port 9876
 """
-import json, subprocess, os, sys, threading, re, time
+import json, subprocess, os, sys, threading, re, time, shutil
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # --- Arg parsing ---
@@ -73,14 +73,14 @@ class Game:
     def __init__(self):
         self.lock = threading.Lock()
         self.step = 0
-        os.environ["STS2_GAME_DIR"] = os.path.expanduser(
-            "~/Library/Application Support/Steam/steamapps/common/"
-            "Slay the Spire 2/SlayTheSpire2.app/Contents/Resources/data_sts2_macos_arm64")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        os.environ.setdefault("STS2_GAME_DIR", os.path.join(root, "lib"))
+        dotnet = shutil.which("dotnet") or os.path.expanduser("~/.dotnet-arm64/dotnet")
         self.proc = subprocess.Popen(
-            [os.path.expanduser("~/.dotnet-arm64/dotnet"), "run", "--no-build",
-             "--project", "Sts2Headless/Sts2Headless.csproj"],
+            [dotnet, "run", "--no-build",
+             "--project", os.path.join(root, "src", "Sts2Headless", "Sts2Headless.csproj")],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            text=True, bufsize=1, cwd=root)
         def _forward_stderr():
             for line in self.proc.stderr:
                 print(f"[GAME] {line.rstrip()}", file=sys.stderr)
