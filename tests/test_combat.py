@@ -210,6 +210,37 @@ class TestCombatEdgeCases:
         # With Pommel Strike + Bloodletting, should play many cards before enemy dies
         assert plays >= 5, f"Expected infinite loop plays >= 5, got {plays}"
 
+    def test_feral_returns_played_claw_without_false_failure(self, game):
+        state = game.start(character="Defect", seed="feral_return")
+        game.skip_neow(state)
+        game.set_player(deck=["FERAL", "CLAW"], relics=[])
+        state = game.enter_room("combat", encounter="SHRINKER_BEETLE_WEAK")
+        feral = next(c for c in state["hand"] if c["id"] == "CARD.FERAL")
+        state = game.act("play_card", card_index=feral["index"])
+        assert len(state["hand"]) == 1
+        hp_before = state["enemies"][0]["hp"]
+        state = game.act("play_card", card_index=0, target_index=0)
+        assert state.get("type") != "error", state
+        assert state["enemies"][0]["hp"] < hp_before
+        assert state["hand"][0]["id"] == "CARD.CLAW"
+        state = game.act("play_card", card_index=0, target_index=0)
+        assert state.get("type") != "error", state
+        assert not any(c["id"] == "CARD.CLAW" for c in state.get("hand", []))
+
+    def test_end_turn_surfaces_well_laid_plans_selection(self, game):
+        state = game.start(character="Silent", seed="retain_prompt")
+        game.skip_neow(state)
+        game.set_player(deck=["WELL_LAID_PLANS", "STRIKE_SILENT"], relics=[])
+        state = game.enter_room("combat", encounter="SHRINKER_BEETLE_WEAK")
+        power = next(c for c in state["hand"] if c["id"] == "CARD.WELL_LAID_PLANS")
+        state = game.act("play_card", card_index=power["index"])
+        state = game.act("end_turn")
+        assert state.get("decision") == "card_select", state
+        assert state["min_select"] == 0
+        state = game.act("select_cards", indices="0")
+        assert state.get("decision") == "combat_play", state
+        assert state["round"] == 2
+
     def test_low_hp_death(self, game):
         """Player with 1 HP should die to any attack."""
         state = game.start(seed="ce2")

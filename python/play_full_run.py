@@ -256,11 +256,13 @@ def play_run(seed: str, character: str = "Ironclad", verbose: bool = True, log: 
                              "args": {"bundle_index": 0}})
 
             elif decision == "card_select":
-                # Auto-select first card
+                # Respect multi-card prompts (e.g. Room Full of Cheese needs two).
                 cards = state.get("cards", [])
                 if cards:
+                    count = max(1, state.get("min_select", 1))
+                    count = min(count, state.get("max_select", len(cards)), len(cards))
                     state = send({"cmd": "action", "action": "select_cards",
-                                 "args": {"indices": "0"}})
+                                 "args": {"indices": ",".join(str(c["index"]) for c in cards[:count])}})
                 else:
                     state = send({"cmd": "action", "action": "skip_select"})
 
