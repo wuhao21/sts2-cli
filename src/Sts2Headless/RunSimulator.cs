@@ -1021,17 +1021,22 @@ public class RunSimulator
 
         Log($"Playing card {card.GetType().Name} (index {cardIndex}) targeting {(target != null ? target.Monster?.GetType().Name ?? "creature" : "none")}");
 
-        var handCountBefore = hand.Count;
-
         var playAction = new PlayCardAction(card, target);
+        bool wasCanceled = false;
+        playAction.BeforeCancelled += _ => wasCanceled = true;
         RunManager.Instance.ActionQueueSet.EnqueueWithoutSynchronizing(playAction);
         WaitForActionExecutor();
 
-        // Check if card play had no effect (hand unchanged, same card still at same index)
-        var handAfter = pcs.Hand.Cards;
-        if (handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card)
+        // Feral can return a successfully played card to the same hand position.
+        // Use the engine action's outcome instead of inferring failure from the hand.
+        if (playAction.Exception != null)
+            return ErrorWithTrace($"Card play failed: {card.Id}", playAction.Exception);
+        if (wasCanceled)
+            return Error($"Card play canceled: {card.Id}");
+        if (playAction.State != MegaCrit.Sts2.Core.Entities.Actions.GameActionState.Finished
+            && !_cardSelector.HasPending && !_cardSelector.HasPendingReward && _pendingBundles == null)
         {
-            return Error($"Card could not be played (still in hand after action): {card.GetType().Name} [{card.Id}]");
+            return Error($"Card play did not complete: {card.Id} ({playAction.State})");
         }
 
         return DetectDecisionPoint();
@@ -1353,10 +1358,15 @@ public class RunSimulator
             return Error("select_cards requires 'indices' (comma-separated card indices)");
 
         var indicesStr = args["indices"]?.ToString() ?? "";
-        var indices = indicesStr.Split(',')
+        var indices = indicesStr.Split(',', StringSplitOptions.RemoveEmptyEntries)
             .Select(s => int.TryParse(s.Trim(), out var v) ? v : -1)
-            .Where(i => i >= 0)
             .ToArray();
+
+        if (indices.Length < _cardSelector.PendingMinSelect || indices.Length > _cardSelector.PendingMaxSelect)
+            return Error($"Select {_cardSelector.PendingMinSelect}-{_cardSelector.PendingMaxSelect} cards");
+        if (indices.Distinct().Count() != indices.Length ||
+            indices.Any(i => i < 0 || i >= (_cardSelector.PendingOptions?.Count ?? 0)))
+            return Error("Card selection contains invalid or duplicate indices");
 
         Log($"Card selection: indices [{string.Join(",", indices)}]");
         _cardSelector.ResolvePendingByIndices(indices);
@@ -1392,6 +1402,8 @@ public class RunSimulator
     {
         if (_cardSelector.HasPending)
         {
+            if (_cardSelector.PendingMinSelect > 0)
+                return Error($"Must select at least {_cardSelector.PendingMinSelect} cards");
             Log("Skipping card selection");
             _cardSelector.CancelPending();
             _syncCtx.Pump();
