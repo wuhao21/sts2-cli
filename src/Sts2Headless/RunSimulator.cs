@@ -218,8 +218,11 @@ public class RunSimulator
     // Event choices run outside ActionExecutor and may pause for external selections.
     // Keep their task until the whole continuation finishes, not just the first prompt.
     private Task? _pendingEventOptionTask;
+    private Task? _pendingShopPurchaseTask;
+    private Task? _pendingTreasureTask;
+    private bool _treasureProcessed;
     private bool _combatTurnTimedOut;
-
+    private bool IsBlitzMode => _runState?.GameMode == GameMode.Blitz;
     // Pending rewards for card selection (populated after combat, before proceeding)
     private List<Reward>? _pendingRewards;
     private CardReward? _pendingCardReward;
@@ -231,7 +234,7 @@ public class RunSimulator
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
     private TaskCompletionSource<IEnumerable<CardModel>>? _pendingBundleTcs;
 
-    public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en")
+    public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en", string gameMode = "Standard")
     {
         try
         {
@@ -242,17 +245,36 @@ public class RunSimulator
             if (player == null)
                 return Error($"Unknown character: {character}");
 
+            GameMode mode;
+            switch ((gameMode ?? "Standard").Trim().ToLowerInvariant())
+            {
+                case "standard":
+                case "":
+                    mode = GameMode.Standard;
+                    break;
+                case "blitz":
+                    mode = GameMode.Blitz;
+                    break;
+                default:
+                    return Error($"Unknown game_mode: {gameMode}. Expected 'Standard' or 'Blitz'.");
+            }
+
+            var clampedAscension = AscensionManager.ClampToMode(mode, ascension);
             var seedStr = seed ?? "headless_" + DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            Log($"Creating RunState with seed={seedStr}");
+            Log($"Creating RunState with mode={mode} asc={clampedAscension} seed={seedStr}");
 
             // Use CreateForTest which properly handles mutable copies internally
             _runState = RunState.CreateForTest(
                 players: new[] { player },
-                ascensionLevel: ascension,
+                gameMode: mode,
+                ascensionLevel: clampedAscension,
                 seed: seedStr
             );
             _combatTurnTimedOut = false;
-
+            _pendingEventOptionTask = null;
+            _pendingShopPurchaseTask = null;
+            _pendingTreasureTask = null;
+            ResetRoomTracking(player);
             // Set up RunManager with test mode
             var netService = new NetSingleplayerGameService();
             RunManager.Instance.SetUpTest(_runState, netService);
@@ -270,7 +292,7 @@ public class RunSimulator
             Log("Run launched");
 
             // Register event handlers for combat turn transitions
-            CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
+            CombatManager.Instance.TurnStarted += state => { DetachUnsafeMonsterVfxHandlers(state); _turnStarted.Set(); };
             CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
 
             // Finalize starting relics
@@ -282,7 +304,7 @@ public class RunSimulator
             Log("Entered Act 0");
 
             // Register card selector for cards that need player choice
-            CardSelectCmd.UseSelector(_cardSelector);
+            RunManager.Instance.CardSelectorStack.UseSelector(player, _cardSelector);
             LocPatches._bundleSimRef = this;
 
             // Now we should be at the map — detect decision point
@@ -445,6 +467,7 @@ public class RunSimulator
                     return Error($"Unknown room type: {roomType}");
             }
 
+            ResetRoomTracking(_runState.Players[0]);
             RunManager.Instance.EnterRoom(room).GetAwaiter().GetResult();
             _syncCtx.Pump();
             WaitForActionExecutor();
@@ -517,16 +540,19 @@ public class RunSimulator
             if (_runState == null)
                 return Error("Failed to create RunState from save");
             _combatTurnTimedOut = false;
-
+            _pendingEventOptionTask = null;
+            _pendingShopPurchaseTask = null;
+            _pendingTreasureTask = null;
+            ResetRoomTracking(_runState.Players[0]);
             Log($"RunState created, players={_runState.Players?.Count}");
 
             var netService = new NetSingleplayerGameService();
             RunManager.Instance.SetUpSavedSingleplayer(_runState, save).GetAwaiter().GetResult();
             LocalContext.NetId = netService.NetId;
 
-            CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
+            CombatManager.Instance.TurnStarted += state => { DetachUnsafeMonsterVfxHandlers(state); _turnStarted.Set(); };
             CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
-            CardSelectCmd.UseSelector(_cardSelector);
+            RunManager.Instance.CardSelectorStack.UseSelector(_runState.Players[0], _cardSelector);
             LocPatches._bundleSimRef = this;
 
             var savedRoom = _runState.CurrentRoom;
@@ -906,6 +932,8 @@ public class RunSimulator
                     return DoBuyPotion(player, args);
                 case "remove_card":
                     return DoRemoveCard(player);
+                case "buy_blitz_entry":
+                    return DoBuyBlitzEntry(player, args);
                 case "select_bundle":
                     return DoSelectBundle(player, args);
                 case "select_cards":
@@ -938,10 +966,7 @@ public class RunSimulator
             return Error("select_map_node requires 'col' and 'row'");
 
         // Reset tracking for new room
-        _rewardsProcessed = false;
-        _pendingCardReward = null;
-        _pendingRewards = null;
-        _lastKnownHp = player.Creature?.CurrentHp ?? 0;
+        ResetRoomTracking(player);
 
         var col = Convert.ToInt32(args["col"]);
         var row = Convert.ToInt32(args["row"]);
@@ -1009,6 +1034,8 @@ public class RunSimulator
                 else if (alive.Count > 1)
                     return Error($"Card {card.Id.Entry} targets a single enemy (AnyEnemy); " +
                                  $"'target_index' is required when multiple enemies are alive ({alive.Count}).");
+                else
+                    return Error($"Card {card.Id.Entry} targets an enemy (AnyEnemy), but no alive enemy is available.");
             }
         }
         // All other target types (None, All, etc.) → leave target as null
@@ -1193,8 +1220,10 @@ public class RunSimulator
             return Error("buy_card requires 'card_index'");
 
         var idx = Convert.ToInt32(args["card_index"]);
-        var allEntries = merchantRoom.GetLocalInventory().CharacterCardEntries
-            .Concat(merchantRoom.GetLocalInventory().ColorlessCardEntries).ToList();
+        var inv = RunManager.Instance.MerchantSynchronizer?.GetLocalInventory();
+        if (inv == null) return Error("No shop inventory");
+        var allEntries = inv.CharacterCardEntries
+            .Concat(inv.ColorlessCardEntries).ToList();
         if (idx < 0 || idx >= allEntries.Count)
             return Error($"Invalid card index {idx}");
 
@@ -1204,7 +1233,7 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
+            RunManager.Instance.MerchantSynchronizer!.PurchaseLocalEntry(entry).GetAwaiter().GetResult();
             _syncCtx.Pump();
             Log($"Bought card: {entry.CreationResult?.Card?.GetType().Name ?? "?"} for {entry.Cost}g");
         }
@@ -1221,7 +1250,9 @@ public class RunSimulator
             return Error("buy_relic requires 'relic_index'");
 
         var idx = Convert.ToInt32(args["relic_index"]);
-        var entries = merchantRoom.GetLocalInventory().RelicEntries;
+        var inv = RunManager.Instance.MerchantSynchronizer?.GetLocalInventory();
+        if (inv == null) return Error("No shop inventory");
+        var entries = inv.RelicEntries;
         if (idx < 0 || idx >= entries.Count) return Error($"Invalid relic index {idx}");
 
         var entry = entries[idx];
@@ -1234,8 +1265,7 @@ public class RunSimulator
             // Adroit, #80). Run the purchase on a background task and yield as soon as a
             // pending selection appears so the caller can resolve it; the background task
             // continues once the selector's TCS is fed by select_cards.
-            var inv = merchantRoom.GetLocalInventory();
-            var task = Task.Run(() => entry.OnTryPurchaseWrapper(inv));
+            var task = Task.Run(() => RunManager.Instance.MerchantSynchronizer!.PurchaseLocalEntry(entry));
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -1266,7 +1296,9 @@ public class RunSimulator
             return Error("buy_potion requires 'potion_index'");
 
         var idx = Convert.ToInt32(args["potion_index"]);
-        var entries = merchantRoom.GetLocalInventory().PotionEntries;
+        var inv = RunManager.Instance.MerchantSynchronizer?.GetLocalInventory();
+        if (inv == null) return Error("No shop inventory");
+        var entries = inv.PotionEntries;
         if (idx < 0 || idx >= entries.Count) return Error($"Invalid potion index {idx}");
 
         var entry = entries[idx];
@@ -1275,7 +1307,7 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
+            RunManager.Instance.MerchantSynchronizer!.PurchaseLocalEntry(entry).GetAwaiter().GetResult();
             _syncCtx.Pump();
             Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1293,14 +1325,15 @@ public class RunSimulator
         if (_runState?.CurrentRoom is not MerchantRoom merchantRoom)
             return Error("Not in a shop");
 
-        var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
+        var inv = RunManager.Instance.MerchantSynchronizer?.GetLocalInventory();
+        var removal = inv?.CardRemovalEntry;
         if (removal == null) return Error("No card removal available");
         if (player.Gold < removal.Cost) return Error("Not enough gold");
 
         try
         {
             // Run on background thread so card selection can pause (same pattern as event options)
-            var task = Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()));
+            var task = Task.Run(() => RunManager.Instance.MerchantSynchronizer!.PurchaseLocalEntry(removal));
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -1319,6 +1352,36 @@ public class RunSimulator
         }
         catch (Exception ex) { return Error($"Remove card failed: {ex.Message}"); }
 
+        return DetectDecisionPoint();
+    }
+
+    private Dictionary<string, object?> DoBuyBlitzEntry(Player player, Dictionary<string, object?>? args)
+    {
+        if (_runState?.CurrentRoom is not MerchantRoom)
+            return Error("Not in a shop");
+        if (args == null || !args.ContainsKey("index"))
+            return Error("buy_blitz_entry requires 'index'");
+
+        if (_pendingShopPurchaseTask != null)
+            return DetectDecisionPoint();
+
+        var inv = RunManager.Instance.MerchantSynchronizer?.GetLocalInventory();
+        if (inv == null || !inv.IsBlitzShop)
+            return Error("Not in a Blitz shop");
+        if (inv.BlitzChoicesRemaining <= 0)
+            return Error("No Blitz shop choices remaining");
+
+        var idx = Convert.ToInt32(args["index"]);
+        var entries = inv.BlitzEntries;
+        if (idx < 0 || idx >= entries.Count)
+            return Error($"Invalid blitz entry index {idx}");
+
+        var entry = entries[idx];
+        if (!entry.IsStocked)
+            return Error($"Blitz entry {idx} ({entry.MerchantEntryType}) is not available (status={entry.Status})");
+
+        Log($"Purchasing Blitz shop entry [{idx}] {entry.MerchantEntryType}");
+        _pendingShopPurchaseTask = Task.Run(() => RunManager.Instance.MerchantSynchronizer!.PurchaseLocalEntry(entry));
         return DetectDecisionPoint();
     }
 
@@ -1352,10 +1415,11 @@ public class RunSimulator
         if (args == null || !args.ContainsKey("indices"))
             return Error("select_cards requires 'indices' (comma-separated card indices)");
 
-        var indicesStr = args["indices"]?.ToString() ?? "";
+        var indicesStr = (args["indices"]?.ToString() ?? "").Trim().Trim('[', ']');
         var indices = indicesStr.Split(',')
             .Select(s => int.TryParse(s.Trim(), out var v) ? v : -1)
             .Where(i => i >= 0)
+            .Distinct()
             .ToArray();
 
         Log($"Card selection: indices [{string.Join(",", indices)}]");
@@ -1370,14 +1434,13 @@ public class RunSimulator
             Thread.Sleep(200);
             _syncCtx.Pump();
             WaitForActionExecutor();
-            // Force to map after SMITH completes (same pattern as HEAL)
-            Log("Card selection in rest site (SMITH), forcing to map");
-            ForceToMap();
-            return MapSelectState();
+            // Advance after SMITH completes (same pattern as HEAL)
+            Log("Card selection in rest site (SMITH), advancing");
+            return AdvanceAfterRoom();
         }
 
-        // Extra wait for shop card removal: the purchase task needs to finish
-        if (_runState?.CurrentRoom is MerchantRoom)
+        // Extra wait for shop card removal when not driven by _pendingShopPurchaseTask
+        if (_runState?.CurrentRoom is MerchantRoom && _pendingShopPurchaseTask == null)
         {
             Thread.Sleep(200);
             _syncCtx.Pump();
@@ -1537,15 +1600,14 @@ public class RunSimulator
             // Wait for the action to complete (heal/dig), then force transition to map.
             if (!_cardSelector.HasPending)
             {
-                Log("Rest site: option chosen (non-Smith), waiting for action then forcing to map");
+                Log("Rest site: option chosen (non-Smith), waiting for action then advancing");
                 // Give the action time to complete (heal HP, dig for relic, etc.)
                 WaitForActionExecutor();
                 _syncCtx.Pump();
                 Thread.Sleep(200);
                 _syncCtx.Pump();
                 WaitForActionExecutor();
-                ForceToMap();
-                return MapSelectState();
+                return AdvanceAfterRoom();
             }
         }
         // For events — use EventSynchronizer
@@ -1583,7 +1645,12 @@ public class RunSimulator
     private Dictionary<string, object?> DoLeaveRoom(Player player)
     {
         Log("Leaving room");
-        try { RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult(); }
+        if (IsBlitzMode)
+        {
+            return AdvanceAfterRoom();
+        }
+
+        try { RunManager.Instance.ProceedFromTerminalRewardsScreenAsync().GetAwaiter().GetResult(); }
         catch { }
         _syncCtx.Pump();
         WaitForActionExecutor();
@@ -1644,12 +1711,16 @@ public class RunSimulator
         {
             if (combatRoom.IsPreFinished || !CombatManager.Instance.IsInProgress)
             {
+                if (IsBlitzMode)
+                    return AdvanceAfterRoom();
+
                 // Final act boss → victory (same rule as DetectPostCombatState, #81).
                 if (_runState != null && _runState.CurrentActIndex >= 2)
                 {
                     Log($"Final boss defeated via Proceed (Act {_runState.CurrentActIndex + 1}), reporting victory");
                     return GameOverState(true);
                 }
+                ResetRoomTracking(player);
                 RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
                 WaitForActionExecutor();
                 HealBetweenActs();
@@ -1657,7 +1728,10 @@ public class RunSimulator
             }
         }
 
-        RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+        if (IsBlitzMode)
+            return AdvanceAfterRoom();
+
+        RunManager.Instance.ProceedFromTerminalRewardsScreenAsync().GetAwaiter().GetResult();
         WaitForActionExecutor();
         return DetectDecisionPoint();
     }
@@ -1672,7 +1746,8 @@ public class RunSimulator
             return Error("No run in progress");
 
         WaitForEventOption();
-
+        WaitForShopPurchase();
+        WaitForTreasure();
         var player = _runState.Players[0];
 
         // Check game over (death)
@@ -1724,7 +1799,7 @@ public class RunSimulator
                 var stats = new Dictionary<string, object?>();
                 try { foreach (var dv in cr.Card.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
                 var rrkws = cr.Card.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
-                return new Dictionary<string, object?>
+                var rcard = new Dictionary<string, object?>
                 {
                     ["index"] = i,
                     ["id"] = cr.Card.Id.ToString(),
@@ -1732,11 +1807,18 @@ public class RunSimulator
                     ["cost"] = cr.Card.EnergyCost?.GetResolved() ?? 0,
                     ["type"] = cr.Card.Type.ToString(),
                     ["rarity"] = cr.Card.Rarity.ToString(),
+                    ["upgraded"] = cr.Card.IsUpgraded,
                     ["description"] = _loc.Bilingual("cards", cr.Card.Id.Entry + ".description"),
                     ["stats"] = stats.Count > 0 ? stats : null,
                     ["keywords"] = rrkws?.Count > 0 ? rrkws : null,
                     ["after_upgrade"] = GetUpgradedInfo(cr.Card),
                 };
+                if (cr.Card.Enchantment != null)
+                {
+                    rcard["enchantment"] = _loc.Bilingual("enchantments", cr.Card.Enchantment.Id.Entry + ".title");
+                    try { if (cr.Card.Enchantment.Amount != 0) rcard["enchantment_amount"] = cr.Card.Enchantment.Amount; } catch { }
+                }
+                return rcard;
             }).ToList();
 
             return new Dictionary<string, object?>
@@ -1760,7 +1842,7 @@ public class RunSimulator
                 var stats = new Dictionary<string, object?>();
                 try { foreach (var dv in card.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
                 var selkws = card.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
-                return new Dictionary<string, object?>
+                var scard = new Dictionary<string, object?>
                 {
                     ["index"] = i,
                     ["id"] = card.Id.ToString(),
@@ -1774,6 +1856,12 @@ public class RunSimulator
                     ["keywords"] = selkws?.Count > 0 ? selkws : null,
                     ["after_upgrade"] = GetUpgradedInfo(card),
                 };
+                if (card.Enchantment != null)
+                {
+                    scard["enchantment"] = _loc.Bilingual("enchantments", card.Enchantment.Id.Entry + ".title");
+                    try { if (card.Enchantment.Amount != 0) scard["enchantment_amount"] = card.Enchantment.Amount; } catch { }
+                }
+                return scard;
             }).ToList();
 
             return new Dictionary<string, object?>
@@ -2080,7 +2168,7 @@ public class RunSimulator
                 ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
                 ["type"] = c.Type.ToString(),
                 ["rarity"] = c.Rarity.ToString(),
-                ["can_play"] = c.CanPlay(out _, out _),
+                ["can_play"] = c.CanPlay(out _, out _) && (c.TargetType != TargetType.AnyEnemy || aliveEnemiesForTargeting.Count > 0),
                 ["target_type"] = c.TargetType.ToString(),
                 ["stats"] = stats.Count > 0 ? stats : null,
                 ["description"] = _loc.Bilingual("cards", c.Id.Entry + ".description"),
@@ -2200,6 +2288,20 @@ public class RunSimulator
             ["player_powers"] = playerPowers?.Count > 0 ? playerPowers : null,
             ["draw_pile_count"] = pcs?.DrawPile?.Cards?.Count ?? 0,
             ["discard_pile_count"] = pcs?.DiscardPile?.Cards?.Count ?? 0,
+            ["draw_pile"] = pcs?.DrawPile?.Cards?.Where(c => c != null).Select(c => new Dictionary<string, object?>
+            {
+                ["id"] = c.Id.ToString(),
+                ["name"] = _loc.Card(c.Id.Entry),
+                ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
+                ["type"] = c.Type.ToString(),
+            }).ToList() ?? new(),
+            ["discard_pile"] = pcs?.DiscardPile?.Cards?.Where(c => c != null).Select(c => new Dictionary<string, object?>
+            {
+                ["id"] = c.Id.ToString(),
+                ["name"] = _loc.Card(c.Id.Entry),
+                ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
+                ["type"] = c.Type.ToString(),
+            }).ToList() ?? new(),
         };
 
         // Character-specific mechanics
@@ -2207,6 +2309,10 @@ public class RunSimulator
         {
             // Defect: Orbs
             var orbQueue = pcs?.OrbQueue;
+            if (orbQueue != null && orbQueue.Capacity > 0)
+            {
+                result["orb_slots"] = orbQueue.Capacity;
+            }
             if (orbQueue?.Orbs?.Count > 0)
             {
                 result["orbs"] = orbQueue.Orbs.Select((orb, i) => new Dictionary<string, object?>
@@ -2309,6 +2415,9 @@ public class RunSimulator
         // map_select. Report victory directly in that case.
         if (combatRoom.RoomType == RoomType.Boss)
         {
+            if (IsBlitzMode)
+                return AdvanceAfterRoom();
+
             if (_runState != null && _runState.CurrentActIndex >= 2)
             {
                 Log($"Final boss defeated (Act {_runState.CurrentActIndex + 1}), reporting victory");
@@ -2317,6 +2426,7 @@ public class RunSimulator
             Log("Boss defeated, entering next act");
             try
             {
+                ResetRoomTracking(player);
                 RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
                 _syncCtx.Pump();
                 WaitForActionExecutor();
@@ -2326,9 +2436,8 @@ public class RunSimulator
             return DetectDecisionPoint();
         }
 
-        // Normal → go to map
-        ForceToMap();
-        return MapSelectState();
+        // Normal → advance to next node (Blitz) or map (Standard)
+        return AdvanceAfterRoom();
     }
 
     private Dictionary<string, object?> CardRewardState(Player player, CombatRoom? combatRoom)
@@ -2341,7 +2450,7 @@ public class RunSimulator
             var stats = new Dictionary<string, object?>();
             try { foreach (var dv in c.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
             var crkws = c.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
-            return new Dictionary<string, object?>
+            var rcard = new Dictionary<string, object?>
             {
                 ["index"] = i,
                 ["id"] = c.Id.ToString(),
@@ -2349,11 +2458,18 @@ public class RunSimulator
                 ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
                 ["type"] = c.Type.ToString(),
                 ["rarity"] = c.Rarity.ToString(),
+                ["upgraded"] = c.IsUpgraded,
                 ["description"] = _loc.Bilingual("cards", c.Id.Entry + ".description"),
                 ["stats"] = stats.Count > 0 ? stats : null,
                 ["keywords"] = crkws?.Count > 0 ? crkws : null,
                 ["after_upgrade"] = GetUpgradedInfo(c),
             };
+            if (c.Enchantment != null)
+            {
+                rcard["enchantment"] = _loc.Bilingual("enchantments", c.Enchantment.Id.Entry + ".title");
+                try { if (c.Enchantment.Amount != 0) rcard["enchantment_amount"] = c.Enchantment.Amount; } catch { }
+            }
+            return rcard;
         }).ToList();
 
         return new Dictionary<string, object?>
@@ -2368,11 +2484,21 @@ public class RunSimulator
         };
     }
 
+    private void ResetRoomTracking(Player? player = null)
+    {
+        _rewardsProcessed = false;
+        _pendingCardReward = null;
+        _pendingRewards = null;
+        _treasureProcessed = false;
+        if (player?.Creature != null)
+            _lastKnownHp = player.Creature.CurrentHp;
+    }
+
     private void ForceToMap()
     {
         try
         {
-            RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+            RunManager.Instance.ProceedFromTerminalRewardsScreenAsync().GetAwaiter().GetResult();
             _syncCtx.Pump();
         }
         catch { }
@@ -2384,18 +2510,89 @@ public class RunSimulator
         }
     }
 
+    private Dictionary<string, object?> AdvanceAfterRoom()
+    {
+        if (_runState == null)
+            return Error("No run in progress");
+
+        var player = _runState.Players[0];
+
+        if (!IsBlitzMode)
+        {
+            ForceToMap();
+            return MapSelectState();
+        }
+
+        // Nested combat inside an event: resume the parent event instead of advancing node.
+        if (_runState.CurrentRoomCount > 1 &&
+            _runState.CurrentRoom is CombatRoom { ShouldResumeParentEventAfterCombat: not false })
+        {
+            Log("Blitz: resuming parent event after nested combat");
+            ResetRoomTracking(player);
+            RunManager.Instance.ProceedFromTerminalRewardsScreenAsync().GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            return DetectDecisionPoint();
+        }
+
+        // In TestMode, MerchantRoom.Exit skips OnMerchantExited(), so clean up explicitly.
+        if (_runState.CurrentRoom is MerchantRoom)
+        {
+            try { RunManager.Instance.MerchantSynchronizer?.OnMerchantExited(); }
+            catch (Exception ex) { Log($"OnMerchantExited: {ex.Message}"); }
+        }
+
+        WaitForActionExecutor();
+        _syncCtx.Pump();
+        ResetRoomTracking(player);
+
+        if (_runState.Map is not BlitzActMap blitzMap)
+            return Error("GameMode is Blitz, but current map is not BlitzActMap");
+
+        var mapPoints = blitzMap.GetMapPoints();
+        var currentPoint = _runState.CurrentMapPoint;
+        int currentIdx = currentPoint != null ? mapPoints.IndexOf(currentPoint) : -1;
+        int nextIdx = currentIdx + 1;
+
+        if (nextIdx < mapPoints.Count)
+        {
+            var nextPoint = mapPoints[nextIdx];
+            Log($"Blitz advancing to node {nextIdx}/{mapPoints.Count - 1}: {nextPoint.PointType} ({nextPoint.coord.col},{nextPoint.coord.row})");
+            RunManager.Instance.EnterMapCoord(nextPoint.coord).GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            return DetectDecisionPoint();
+        }
+
+        // Finished the last node (Boss) of the act
+        if (_runState.CurrentActIndex >= _runState.Acts.Count - 1)
+        {
+            Log($"Blitz final boss defeated (Act {_runState.CurrentActIndex + 1}), reporting victory");
+            return GameOverState(true);
+        }
+
+        Log($"Blitz entering next act (Act {_runState.CurrentActIndex + 2})");
+        RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
+        _syncCtx.Pump();
+        WaitForActionExecutor();
+        return DetectDecisionPoint();
+    }
+
     private Dictionary<string, object?> EventChoiceState(EventRoom eventRoom)
     {
         var localEvent = RunManager.Instance.EventSynchronizer?.GetLocalEvent();
         _syncCtx.Pump();
 
-        // If event is finished, proceed to map
+        // If event is finished, proceed
         if (localEvent == null || localEvent.IsFinished)
         {
             Log($"Event {localEvent?.GetType().Name ?? "null"} finished, proceeding");
+            if (IsBlitzMode)
+                return AdvanceAfterRoom();
+
             try
             {
-                RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+                RunManager.Instance.ProceedFromTerminalRewardsScreenAsync().GetAwaiter().GetResult();
                 _syncCtx.Pump();
             }
             catch { }
@@ -2412,9 +2609,7 @@ public class RunSimulator
         if (currentOptions == null || currentOptions.Count == 0)
         {
             Log($"Event {localEvent.GetType().Name} has no options, auto-skipping");
-            try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
-            catch { }
-            return MapSelectState();
+            return AdvanceAfterRoom();
         }
 
         var options = currentOptions
@@ -2561,10 +2756,9 @@ public class RunSimulator
 
         if (options == null || options.Count == 0)
         {
-            // Options empty = choice already made (synchronizer cleared them), go to map
-            Log("Rest site: options empty, proceeding to map");
-            ForceToMap();
-            return MapSelectState();
+            // Options empty = choice already made (synchronizer cleared them), advance
+            Log("Rest site: options empty, advancing");
+            return AdvanceAfterRoom();
         }
 
         var optionList = options.Select((opt, i) => new Dictionary<string, object?>
@@ -2587,9 +2781,27 @@ public class RunSimulator
 
     private Dictionary<string, object?> ShopState(MerchantRoom merchantRoom, Player player)
     {
-        var inv = merchantRoom.GetLocalInventory();
-        if (inv == null) { ForceToMap(); return MapSelectState(); }
+        var inv = RunManager.Instance.MerchantSynchronizer?.GetLocalInventory();
+        if (inv == null) return AdvanceAfterRoom();
 
+        if (inv.IsBlitzShop)
+        {
+            var blitzEntries = inv.BlitzEntries.Select((e, i) => SerializeBlitzEntry(e, i)).ToList();
+            return new Dictionary<string, object?>
+            {
+                ["type"] = "decision",
+                ["decision"] = "shop",
+                ["context"] = RunContext(),
+                ["is_blitz_shop"] = true,
+                ["blitz_choices_remaining"] = inv.BlitzChoicesRemaining,
+                ["blitz_entries"] = blitzEntries,
+                ["cards"] = new List<Dictionary<string, object?>>(),
+                ["relics"] = new List<Dictionary<string, object?>>(),
+                ["potions"] = new List<Dictionary<string, object?>>(),
+                ["card_removal_cost"] = null,
+                ["player"] = PlayerSummary(player),
+            };
+        }
         var cards = inv.CharacterCardEntries.Concat(inv.ColorlessCardEntries)
             .Select((e, i) =>
             {
@@ -2652,13 +2864,14 @@ public class RunSimulator
             ["is_stocked"] = e.IsStocked,
         }).ToList();
 
-        var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
+        var removal = inv.CardRemovalEntry;
 
         return new Dictionary<string, object?>
         {
             ["type"] = "decision",
             ["decision"] = "shop",
             ["context"] = RunContext(),
+            ["is_blitz_shop"] = false,
             ["cards"] = cards,
             ["relics"] = relics,
             ["potions"] = potions,
@@ -2667,8 +2880,83 @@ public class RunSimulator
         };
     }
 
+    private Dictionary<string, object?> SerializeBlitzEntry(BlitzMerchantEntry entry, int index)
+    {
+        var title = _loc.Bilingual("merchant_room", entry.Title.LocEntryKey);
+        var description = _loc.Bilingual("merchant_room", entry.Description.LocEntryKey);
+
+        var dict = new Dictionary<string, object?>
+        {
+            ["index"] = index,
+            ["type"] = entry.MerchantEntryType.ToString(),
+            ["title"] = title,
+            ["description"] = description,
+            ["is_cursed"] = entry.IsCursed,
+            ["is_rare"] = entry.IsRare,
+            ["status"] = entry.Status.ToString(),
+            ["is_stocked"] = entry.IsStocked,
+            ["available"] = entry.Status == BlitzMerchantEntry.BlitzEntryStatus.Available,
+            ["cost"] = entry.Cost,
+        };
+
+        try
+        {
+            if (entry is BlitzMerchantCardEnchantEntry)
+            {
+                var field = entry.GetType().GetField("_enchantment", NonPublic);
+                if (field?.GetValue(entry) is ValueTuple<EnchantmentModel, int> ench && ench.Item1 != null)
+                {
+                    var enchName = _loc.Bilingual("enchantments", ench.Item1.Id.Entry + ".title");
+                    var showAmount = ench.Item1.ShowAmount;
+                    var amount = showAmount ? ench.Item2 : 1;
+                    var amountSuffix = amount > 1 ? $" {amount}" : "";
+                    dict["enchantment"] = ench.Item1.Id.Entry;
+                    dict["enchantment_name"] = enchName;
+                    dict["enchantment_amount"] = ench.Item2;
+                    dict["title"] = title.Replace("{Enchantment}", enchName);
+                    dict["description"] = description
+                        .Replace("{Enchantment}", enchName)
+                        .Replace("{Amount:plural:| {}}", amountSuffix)
+                        .Replace("{Amount}", amount.ToString());
+                }
+            }
+            else if (entry is BlitzMerchantGlamEntry)
+            {
+                var enchName = _loc.Bilingual("enchantments", "GLAM.title");
+                dict["enchantment"] = "GLAM";
+                dict["enchantment_name"] = enchName;
+                dict["enchantment_amount"] = 1;
+                dict["title"] = title.Replace("{Enchantment}", enchName);
+                dict["description"] = description.Replace("{Enchantment}", enchName);
+            }
+            else if (entry is BlitzMerchantPrismaticCardRewardEntry)
+            {
+                var field = entry.GetType().GetField("_character", NonPublic);
+                if (field?.GetValue(entry) is CharacterModel ch)
+                {
+                    var chName = _loc.Bilingual("characters", ch.Id.Entry + ".shortTitle");
+                    dict["character"] = ch.Id.Entry;
+                    dict["character_name"] = chName;
+                    dict["title"] = title.Replace("{Character}", chName);
+                    dict["description"] = description.Replace("{Character}", chName);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"SerializeBlitzEntry metadata error: {ex.Message}");
+        }
+
+        return dict;
+    }
+
     private Dictionary<string, object?> TreasureState(TreasureRoom treasureRoom)
     {
+        if (_treasureProcessed)
+        {
+            return AdvanceAfterRoom();
+        }
+
         // Treasure rooms give relics via TreasureRoomRelicSynchronizer
         Log("Treasure room — collecting rewards");
 
@@ -2678,26 +2966,31 @@ public class RunSimulator
         // TreasureRoom.EnterInternal opens a relic-picking session (BeginRelicPicking) that the
         // headless must drive, otherwise (a) no relic is ever awarded and (b) the session stays
         // open so the NEXT treasure room's BeginRelicPicking throws "relic picking session while
-        // one was already occurring!" (issue #56). Auto-pick the first offered relic: PickRelicLocally
-        // enqueues a PickRelicAction whose execution awards the relic and ends the session
-        // (OnPicked -> EndRelicVoting). An empty offer is closed with CompleteWithNoRelics.
+        // one was already occurring!" (issue #56).
+        // In Blitz singleplayer, _roundsLeft starts at 2 and RelicsAwarded fires twice
+        // (isFinalRound=false on round 1, isFinalRound=true on round 2), so loop until
+        // CurrentRelics == null (or isFinalRound == true).
+        var allAwarded = new List<MegaCrit.Sts2.Core.Entities.TreasureRelicPicking.RelicPickingResult>();
         try
         {
             var relicSync = RunManager.Instance.TreasureRoomRelicSynchronizer;
-            if (relicSync?.CurrentRelics != null)
+            int safetyRounds = 0;
+            while (relicSync?.CurrentRelics != null && safetyRounds < 5)
             {
-                // The actual relic grant normally lives in the UI node's RelicsAwarded handler
-                // (RelicCmd.Obtain per result), which is absent in headless. Capture the awarded
-                // results, then grant them ourselves after the pick resolves (granting inside the
-                // event — mid action-execution — risks re-entrancy).
+                safetyRounds++;
                 List<MegaCrit.Sts2.Core.Entities.TreasureRelicPicking.RelicPickingResult>? awarded = null;
-                Action<List<MegaCrit.Sts2.Core.Entities.TreasureRelicPicking.RelicPickingResult>> capture = r => awarded = r;
+                bool isFinalRound = false;
+                Action<List<MegaCrit.Sts2.Core.Entities.TreasureRelicPicking.RelicPickingResult>, bool> capture = (r, final) =>
+                {
+                    awarded = r;
+                    isFinalRound = final;
+                };
                 relicSync.RelicsAwarded += capture;
                 try
                 {
                     if (relicSync.CurrentRelics.Count > 0)
                     {
-                        Log($"Auto-picking treasure relic 0 of {relicSync.CurrentRelics.Count}");
+                        Log($"Auto-picking treasure relic round {safetyRounds}: index 0 of {relicSync.CurrentRelics.Count}");
                         relicSync.PickRelicLocally(0);
                     }
                     else
@@ -2711,46 +3004,48 @@ public class RunSimulator
                 finally { relicSync.RelicsAwarded -= capture; }
 
                 if (awarded != null)
-                {
-                    foreach (var res in awarded)
-                    {
-                        if (res.relic != null && res.player != null)
-                            RelicCmd.Obtain(res.relic.ToMutable(), res.player).GetAwaiter().GetResult();
-                    }
-                    _syncCtx.Pump();
-                    WaitForActionExecutor();
-                    _syncCtx.Pump();
-                }
+                    allAwarded.AddRange(awarded);
+
+                if (isFinalRound)
+                    break;
             }
         }
         catch (Exception ex) { Log($"Treasure relic pick: {ex.Message}"); }
 
-        try
+        _treasureProcessed = true;
+
+        // Run relic obtain + extra treasure rewards on a background task so any relic pickup
+        // that opens a card_select / card_reward / bundle_select can yield cleanly instead of deadlocking.
+        _pendingTreasureTask = Task.Run(async () =>
         {
-            treasureRoom.DoNormalRewards().GetAwaiter().GetResult();
-            _syncCtx.Pump();
-            treasureRoom.DoExtraRewardsIfNeeded().GetAwaiter().GetResult();
-            _syncCtx.Pump();
-        }
-        catch (InvalidOperationException ex) when (ex.Message.Contains("relic picking session"))
-        {
-            // BUG-013: Relic session conflict — wait for pending session then retry
-            Log($"Relic session conflict, waiting and retrying: {ex.Message}");
-            WaitForActionExecutor();
-            _syncCtx.Pump();
+            foreach (var res in allAwarded)
+            {
+                if (res.relic != null && res.player != null)
+                {
+                    try { await RelicCmd.Obtain(res.relic.ToMutable(), res.player); }
+                    catch (Exception ex) { Log($"Treasure RelicCmd.Obtain: {ex.Message}"); }
+                }
+            }
             try
             {
-                treasureRoom.DoNormalRewards().GetAwaiter().GetResult();
-                _syncCtx.Pump();
-                treasureRoom.DoExtraRewardsIfNeeded().GetAwaiter().GetResult();
-                _syncCtx.Pump();
+                await treasureRoom.DoNormalRewards();
+                await treasureRoom.DoExtraRewardsIfNeeded();
             }
-            catch (Exception retryEx) { Log($"Treasure rewards retry failed: {retryEx.Message}"); }
-        }
-        catch (Exception ex) { Log($"Treasure rewards: {ex.Message}"); }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("relic picking session"))
+            {
+                Log($"Relic session conflict in treasure rewards: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                Log($"Treasure rewards: {ex.Message}");
+            }
+        });
 
-        ForceToMap();
-        return MapSelectState();
+        WaitForTreasure();
+        if (HasPendingSelection)
+            return DetectDecisionPoint();
+
+        return AdvanceAfterRoom();
     }
 
     private Dictionary<string, object?> GameOverState(bool isVictory)
@@ -2818,6 +3113,74 @@ public class RunSimulator
         // Surface failed continuations instead of silently re-exporting old options.
         task.GetAwaiter().GetResult();
         _syncCtx.Pump();
+    }
+
+    private void WaitForShopPurchase()
+    {
+        var task = _pendingShopPurchaseTask;
+        if (task == null) return;
+
+        var deadline = Environment.TickCount64 + 5000;
+        while (!task.IsCompleted)
+        {
+            _syncCtx.Pump();
+            if (task.IsCompleted) break;
+            if (HasPendingSelection) return;
+            if (Environment.TickCount64 >= deadline)
+                throw new TimeoutException("Shop purchase did not finish or reach a selection within 5 seconds");
+            Thread.Sleep(1);
+        }
+
+        _pendingShopPurchaseTask = null;
+        task.GetAwaiter().GetResult();
+        _syncCtx.Pump();
+        WaitForActionExecutor();
+    }
+
+    private void WaitForTreasure()
+    {
+        var task = _pendingTreasureTask;
+        if (task == null) return;
+
+        var deadline = Environment.TickCount64 + 5000;
+        while (!task.IsCompleted)
+        {
+            _syncCtx.Pump();
+            if (task.IsCompleted) break;
+            if (HasPendingSelection) return;
+            if (Environment.TickCount64 >= deadline)
+                throw new TimeoutException("Treasure reward collection did not finish or reach a selection within 5 seconds");
+            Thread.Sleep(1);
+        }
+
+        _pendingTreasureTask = null;
+        task.GetAwaiter().GetResult();
+        _syncCtx.Pump();
+        WaitForActionExecutor();
+    }
+
+    /// <summary>
+    /// Detach monster death handlers that dereference NCombatRoom.Instance without a null check
+    /// (e.g., SoulNexus.AfterDeath only clears a Spine animation but NREs in headless).
+    /// </summary>
+    private static void DetachUnsafeMonsterVfxHandlers(CombatState combatState)
+    {
+        try
+        {
+            foreach (var creature in combatState.Enemies)
+            {
+                if (creature?.Monster?.GetType().Name == "SoulNexus")
+                {
+                    var method = creature.Monster.GetType().GetMethod("AfterDeath", NonPublic);
+                    if (method != null)
+                    {
+                        var del = (Action<Creature>)Delegate.CreateDelegate(typeof(Action<Creature>), creature.Monster, method);
+                        creature.Died -= del;
+                    }
+                }
+            }
+        }
+        catch { }
     }
 
     private void WaitForActionExecutor()
@@ -2919,12 +3282,19 @@ public class RunSimulator
             {
                 var vars = new Dictionary<string, object?>();
                 try { foreach (var dv in r.DynamicVars.Values) vars[dv.Name] = (int)dv.BaseValue; } catch { }
-                return new Dictionary<string, object?>
+                var relicDict = new Dictionary<string, object?>
                 {
                     ["name"] = _loc.Relic(r.Id.Entry),
                     ["description"] = _loc.Bilingual("relics", r.Id.Entry + ".description"),
                     ["vars"] = vars.Count > 0 ? vars : null,
                 };
+                try
+                {
+                    if (r.ShowCounter && r.DisplayAmount >= 0)
+                        relicDict["counter"] = r.DisplayAmount;
+                }
+                catch { }
+                return relicDict;
             }).ToList(),
             ["potions"] = player.Potions?.Select((p, i) =>
             {
@@ -2985,8 +3355,9 @@ public class RunSimulator
             ["act_name"] = _loc.Act(_runState.Act?.Id.Entry ?? "OVERGROWTH"),
             ["floor"] = _runState.ActFloor,
             ["room_type"] = _runState.CurrentRoom?.RoomType.ToString(),
+            ["game_mode"] = _runState.GameMode.ToString(),
+            ["ascension"] = _runState.AscensionLevel,
         };
-
         // Boss encounter info — use BossEncounter?.Id?.Entry
         try
         {
@@ -3059,6 +3430,12 @@ public class RunSimulator
         // Patch TalkCmd.Play to a no-op (issue #64). Monster speech-bubble VFX during
         // moves (e.g. BygoneEffigy.WakeMove) NRE in headless and break the enemy turn.
         PatchTalkCmd();
+
+        // Patch NAudioManager.Instance to return a stub instance in headless mode.
+        // All NAudioManager methods already no-op when TestMode.IsOn, but callers like
+        // Crusher.BeforeDeath and Rocket.BeforeDeath (Kaiser Crab boss) call
+        // NAudioManager.Instance.PlayOneShot(...) without a null check and NRE.
+        PatchAudioManager();
 
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
@@ -3221,6 +3598,35 @@ public class RunSimulator
         }
     }
 
+    private static void PatchAudioManager()
+    {
+        try
+        {
+            var harmony = new Harmony("sts2headless.audiopatch");
+            var audioType = typeof(MegaCrit.Sts2.Core.Nodes.Audio.NAudioManager);
+            var instanceGetter = audioType.GetProperty("Instance",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.GetGetMethod();
+            if (instanceGetter == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not find NAudioManager.Instance getter to patch");
+                return;
+            }
+            YieldPatches.HeadlessAudioManager = (MegaCrit.Sts2.Core.Nodes.Audio.NAudioManager)
+                System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(audioType);
+            var prefix = typeof(YieldPatches).GetMethod(nameof(YieldPatches.AudioManagerInstancePrefix),
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+            if (prefix != null)
+            {
+                harmony.Patch(instanceGetter, new HarmonyMethod(prefix));
+                Console.Error.WriteLine("[INFO] Patched NAudioManager.Instance to stub instance (prevents boss death audio NRE)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch NAudioManager.Instance: {ex.Message}");
+        }
+    }
+
     private static void PatchTaskYield()
     {
         try
@@ -3322,9 +3728,9 @@ public class RunSimulator
         }
 
         // Pending card reward from events (GetSelectedCardReward blocks until resolved)
-        public List<MegaCrit.Sts2.Core.Entities.Cards.CardCreationResult>? PendingRewardCards { get; private set; }
-        private ManualResetEventSlim? _rewardWait;
-        private int _rewardChoice = -1;
+        public volatile List<MegaCrit.Sts2.Core.Entities.Cards.CardCreationResult>? PendingRewardCards;
+        private volatile ManualResetEventSlim? _rewardWait;
+        private volatile int _rewardChoice = -1;
 
         // NOTE: STS2 build 23372702 changed ICardSelector.GetSelectedCardReward to return
         // a CardRewardSelection struct { CardModel card; CardRewardAlternative alternative }.
@@ -3401,6 +3807,20 @@ public class RunSimulator
         {
             __result = null;
             return false; // Skip original method
+        }
+
+        public static MegaCrit.Sts2.Core.Nodes.Audio.NAudioManager? HeadlessAudioManager;
+
+        /// <summary>
+        /// Harmony prefix: return a stub NAudioManager when NGame.Instance is null in headless mode.
+        /// All NAudioManager methods already no-op under TestMode.IsOn / NonInteractiveMode.IsActive,
+        /// so returning a non-null instance prevents NREs in unguarded callers like Crusher.BeforeDeath
+        /// and Rocket.BeforeDeath.
+        /// </summary>
+        public static bool AudioManagerInstancePrefix(ref MegaCrit.Sts2.Core.Nodes.Audio.NAudioManager? __result)
+        {
+            __result = HeadlessAudioManager;
+            return false;
         }
     }
 
@@ -3858,6 +4278,10 @@ public class RunSimulator
                 RunManager.Instance.CleanUp(graceful: true);
             _runState = null;
             _combatTurnTimedOut = false;
+            _pendingEventOptionTask = null;
+            _pendingShopPurchaseTask = null;
+            _pendingTreasureTask = null;
+            _treasureProcessed = false;
         }
         catch (Exception ex)
         {

@@ -907,10 +907,35 @@ def show_card_reward(state):
 
 def show_shop(state):
     print(f"\n{'─' * 60}")
+    if state.get("is_blitz_shop"):
+        rem = state.get("blitz_choices_remaining", 0)
+        print(f"  {c(t('Blitz Shop','速通商店'), 'bold')}  ({t('Choices remaining','剩余选择')}: {c(str(rem), 'cyan')})")
+        show_player(state.get("player", {}))
+        print()
+        for entry in state.get("blitz_entries", []):
+            idx = entry.get("index", 0)
+            avail = entry.get("available", entry.get("is_stocked", False))
+            status = entry.get("status", "Available")
+            tags = []
+            if entry.get("is_cursed"):
+                tags.append(c(t("CURSED", "诅咒"), "red"))
+            if entry.get("is_rare"):
+                tags.append(c(t("RARE", "稀有"), "yellow"))
+            if not avail:
+                tags.append(c(status.upper(), "dim"))
+            tag_str = (" " + " ".join(tags)) if tags else ""
+            title_str = n(entry.get("title", entry.get("type", "?")))
+            if not avail:
+                title_str = c(title_str, "dim")
+            print(f"  [{idx}] {title_str}{tag_str}")
+            ed = desc(entry.get("description", ""))
+            if ed:
+                print(f"      {c(ed, 'dim')}")
+        print(f"\n  [leave] {t('Leave shop','离开商店')}")
+        return
     print(f"  {c(t('Shop','商店'), 'bold')}")
     show_player(state.get("player", {}))
     gold = state.get("player", {}).get("gold", 0)
-
     print(f"\n  {c(t('Cards:','卡牌:'), 'bold')}")
     for card in state.get("cards", []):
         if not card.get("is_stocked"): continue
@@ -1486,7 +1511,7 @@ def _writeback_continue_save(send_fn, native_save_path):
 
 
 def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
-         load_path=None, native_save_path=None):
+         load_path=None, native_save_path=None, game_mode="Standard"):
     actual_seed = seed or f"cli_{random.randint(1000,9999)}"
     replay_actions = None
     restart_requested = False
@@ -1502,7 +1527,7 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
     proc = subprocess.Popen(
         [DOTNET, "run", "--no-build", "--project", PROJECT],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, bufsize=1,
+        stderr=subprocess.DEVNULL, text=True, bufsize=1,
     )
 
     def read():
@@ -1559,13 +1584,16 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
             print(f"  {c(t('Save loaded!','存档加载成功!'), 'green')}")
         else:
             # Map display lang to game engine lang: "both" falls back to "zh".
-            state = send({
+            start_cmd = {
                 "cmd": "start_run",
                 "character": character,
                 "seed": actual_seed,
                 "ascension": ascension,
                 "lang": game_lang,
-            }, record=False)
+            }
+            if game_mode != "Standard":
+                start_cmd["game_mode"] = game_mode
+            state = send(start_cmd, record=False)
             if state and state.get("type") == "error":
                 print(f"  {c(t('Error:','错误:'), 'red')} {state.get('message', '?')}")
                 return
@@ -1591,13 +1619,14 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                   f"{t('HP','生命')}: {p.get('hp','?')}/{p.get('max_hp','?')}  "
                   f"{t('Gold','金')}: {p.get('gold','?')}")
         else:
+            mode_str = f"  {t('Mode','模式')}: {game_mode}" if game_mode != "Standard" else ""
             asc_str = f"  {t('Ascension','渐进难度')}: {ascension}" if ascension > 0 else ""
-            print(f"{t('Character','角色')}: {character}  {t('Seed','种子')}: {actual_seed}{asc_str}")
+            print(f"{t('Character','角色')}: {character}  {t('Seed','种子')}: {actual_seed}{mode_str}{asc_str}")
         print(f"{t('Type','输入')} {c('help', 'cyan')} {t('for available commands.','查看可用命令。')}\n")
 
         _auto_last_fingerprint = None
         _auto_stuck_count = 0
-
+        _blitz_shop_tried = {}
         while True:
             if not state:
                 print(t("Connection lost.","连接已断开。"))
@@ -1877,25 +1906,56 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
             elif dec == "shop":
                 show_shop(state)
 
-                if auto:
-                    choice = "leave"
-                else:
-                    choice = get_input(t("Buy [index/r0/p0/rm] or (leave)", "购买 [编号/r0/p0/rm] 或 (leave)离开"), state=state)
+                if state.get("is_blitz_shop"):
+                    ctx = state.get("context", {})
+                    shop_loc = (ctx.get("act"), ctx.get("floor"))
+                    tried = _blitz_shop_tried.setdefault(shop_loc, set())
+                    rem = state.get("blitz_choices_remaining", 0)
+                    available = [
+                        e for e in state.get("blitz_entries", [])
+                        if e.get("available", e.get("is_stocked", False))
+                    ]
+                    if auto:
+                        untried = [e for e in available if e["index"] not in tried]
+                        if rem > 0 and untried:
+                            pick = untried[0]
+                            tried.add(pick["index"])
+                            choice = str(pick["index"])
+                        else:
+                            choice = "leave"
+                    else:
+                        valid = {str(e["index"]) for e in available} if rem > 0 else set()
+                        valid.add("leave")
+                        choice = get_input(
+                            t("Choose ware [index] or (leave)", "选择商品 [编号] 或 (leave)离开"),
+                            valid,
+                            state=state,
+                        )
 
-                if choice == "leave":
-                    state = send({"cmd": "action", "action": "leave_room"})
-                elif choice == "rm":
-                    state = send({"cmd": "action", "action": "remove_card"})
-                elif choice.startswith("r"):
-                    state = send({"cmd": "action", "action": "buy_relic",
-                                 "args": {"relic_index": int(choice[1:])}})
-                elif choice.startswith("p"):
-                    state = send({"cmd": "action", "action": "buy_potion",
-                                 "args": {"potion_index": int(choice[1:])}})
+                    if choice == "leave":
+                        state = send({"cmd": "action", "action": "leave_room"})
+                    else:
+                        state = send({"cmd": "action", "action": "buy_blitz_entry",
+                                     "args": {"index": int(choice)}})
                 else:
-                    state = send({"cmd": "action", "action": "buy_card",
-                                 "args": {"card_index": int(choice)}})
+                    if auto:
+                        choice = "leave"
+                    else:
+                        choice = get_input(t("Buy [index/r0/p0/rm] or (leave)", "购买 [编号/r0/p0/rm] 或 (leave)离开"), state=state)
 
+                    if choice == "leave":
+                        state = send({"cmd": "action", "action": "leave_room"})
+                    elif choice == "rm":
+                        state = send({"cmd": "action", "action": "remove_card"})
+                    elif choice.startswith("r"):
+                        state = send({"cmd": "action", "action": "buy_relic",
+                                     "args": {"relic_index": int(choice[1:])}})
+                    elif choice.startswith("p"):
+                        state = send({"cmd": "action", "action": "buy_potion",
+                                     "args": {"potion_index": int(choice[1:])}})
+                    else:
+                        state = send({"cmd": "action", "action": "buy_card",
+                                     "args": {"card_index": int(choice)}})
             elif dec == "rest_site":
                 show_rest_site(state)
                 options = state.get("options", [])
@@ -2037,7 +2097,12 @@ if __name__ == "__main__":
                        help="Character to play")
     parser.add_argument("--ascension", type=int, default=0,
                        choices=range(0, 11), metavar="0-10",
-                       help="Ascension level (0-10)")
+                       help="Ascension level (0-10, clamped to 0-5 in Blitz)")
+    parser.add_argument("--mode", type=str.lower, default="standard",
+                       choices=["standard", "blitz"],
+                       help="Game mode: standard or blitz (default: standard)")
+    parser.add_argument("--blitz", action="store_true",
+                       help="Shorthand for --mode blitz")
     parser.add_argument("--lang", type=str, default="zh",
                        choices=["en", "zh", "both"],
                        help="Display language: en, zh, or both")
@@ -2124,11 +2189,13 @@ if __name__ == "__main__":
     next_auto = args.auto
     next_load_path = load_path
     next_native_save_path = native_save_path
+    game_mode = "Blitz" if (args.blitz or args.mode == "blitz") else "Standard"
     while True:
         restart = play(character=args.character, seed=next_seed, auto=next_auto,
                        ascension=args.ascension, log=not args.no_log,
                        load_path=next_load_path,
-                       native_save_path=next_native_save_path)
+                       native_save_path=next_native_save_path,
+                       game_mode=game_mode)
         if not restart:
             break
         next_seed = None

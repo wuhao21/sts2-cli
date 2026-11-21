@@ -139,6 +139,7 @@ cat > "$PATCH_DIR/Patcher.csproj" << 'PROJ'
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net9.0</TargetFramework>
+    <RollForward>LatestMajor</RollForward>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Mono.Cecil" Version="0.11.6" />
@@ -149,6 +150,7 @@ PROJ
 cat > "$PATCH_DIR/Program.cs" << 'CSHARP'
 using System;
 using System.IO;
+using System.Linq;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 
@@ -212,6 +214,44 @@ foreach (var type in module.Types)
             il.Emit(OpCodes.Ret);
             patches++;
             Console.WriteLine($"  Patched {type.Name}.{method.Name} → Task.CompletedTask");
+        }
+    }
+}
+
+// Patch 3: NAudioManager.get_Instance() → return a cached stub NAudioManager when null
+// Prevents NullReferenceException in unguarded callers like Crusher.BeforeDeath and
+// Rocket.BeforeDeath (Kaiser Crab boss) in headless mode. All NAudioManager methods
+// already no-op when TestMode.IsOn / NonInteractiveMode.IsActive.
+foreach (var type in module.Types)
+{
+    if (type.FullName == "MegaCrit.Sts2.Core.Nodes.Audio.NAudioManager")
+    {
+        var getter = type.Methods.FirstOrDefault(m => m.Name == "get_Instance" && m.Body != null);
+        var ctor = type.Methods.FirstOrDefault(m => m.Name == ".ctor" && !m.IsStatic && m.Parameters.Count == 0);
+        if (getter != null && ctor != null)
+        {
+            var field = type.Fields.FirstOrDefault(f => f.Name == "_headlessFallback");
+            if (field == null)
+            {
+                field = new FieldDefinition("_headlessFallback",
+                    FieldAttributes.Private | FieldAttributes.Static, type);
+                type.Fields.Add(field);
+            }
+            var il = getter.Body.GetILProcessor();
+            getter.Body.Instructions.Clear();
+            getter.Body.ExceptionHandlers.Clear();
+            getter.Body.Variables.Clear();
+            var retInstr = il.Create(OpCodes.Ret);
+            il.Emit(OpCodes.Ldsfld, field);
+            il.Emit(OpCodes.Dup);
+            il.Emit(OpCodes.Brtrue_S, retInstr);
+            il.Emit(OpCodes.Pop);
+            il.Emit(OpCodes.Newobj, ctor);
+            il.Emit(OpCodes.Dup);
+            il.Emit(OpCodes.Stsfld, field);
+            il.Append(retInstr);
+            patches++;
+            Console.WriteLine($"  Patched {type.Name}.get_Instance → cached stub instance");
         }
     }
 }

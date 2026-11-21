@@ -41,7 +41,8 @@ PROJECT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
                        "src", "Sts2Headless", "Sts2Headless.csproj")
 
 
-def play_run(seed: str, character: str = "Ironclad", verbose: bool = True, log: bool = True):
+def play_run(seed: str, character: str = "Ironclad", verbose: bool = True, log: bool = True,
+             game_mode: str = "Standard", ascension: int = 0):
     """Play a complete run and return the result."""
     rng = random.Random(seed)
     logger = GameLogger(character, seed, enabled=log)
@@ -94,8 +95,9 @@ def play_run(seed: str, character: str = "Ironclad", verbose: bool = True, log: 
                 hp = player.get("hp", "?")
                 max_hp = player.get("max_hp", "?")
                 gold = player.get("gold", "?")
-                act = resp.get("act", "?")
-                floor = resp.get("floor", "?")
+                ctx = resp.get("context", {})
+                act = resp.get("act", ctx.get("act", "?"))
+                floor = resp.get("floor", ctx.get("floor", "?"))
                 print(f"  < {rtype}/{decision} act={act} floor={floor} hp={hp}/{max_hp} gold={gold}")
             else:
                 print(f"  < {json.dumps(resp)[:200]}")
@@ -112,13 +114,20 @@ def play_run(seed: str, character: str = "Ironclad", verbose: bool = True, log: 
             print(f"Connected: {ready}")
 
         # Start run
-        state = send({"cmd": "start_run", "character": character, "seed": seed})
+        start_cmd = {
+            "cmd": "start_run",
+            "character": character,
+            "seed": seed,
+            "ascension": ascension,
+            "game_mode": game_mode,
+        }
+        state = send(start_cmd)
 
         step = 0
         max_steps = 2000  # Safety limit
         stuck_count = 0
         last_state_key = None
-
+        blitz_shop_tried: dict[tuple, set[int]] = {}
         while step < max_steps:
             step += 1
 
@@ -132,7 +141,17 @@ def play_run(seed: str, character: str = "Ironclad", verbose: bool = True, log: 
             hand_len = len(state.get("hand", []))
             enemy_hp = sum(e.get("hp", 0) for e in state.get("enemies", []))
             energy = state.get("energy", 0)
-            state_key = f"{decision}:{state.get('round')}:{state.get('player',{}).get('hp')}:{hand_len}:{enemy_hp}:{energy}"
+            ctx = state.get("context", {})
+            shop_key = (
+                f"{state.get('blitz_choices_remaining')}:"
+                f"{sum(1 for e in state.get('blitz_entries', []) if e.get('available'))}"
+                if state.get("is_blitz_shop") else ""
+            )
+            state_key = (
+                f"{decision}:{ctx.get('act')}:{ctx.get('floor')}:{state.get('round')}:"
+                f"{state.get('player',{}).get('hp')}:{state.get('player',{}).get('deck_size')}:"
+                f"{hand_len}:{enemy_hp}:{energy}:{shop_key}"
+            )
             if state_key == last_state_key:
                 stuck_count += 1
                 if stuck_count > 20:
@@ -256,17 +275,44 @@ def play_run(seed: str, character: str = "Ironclad", verbose: bool = True, log: 
                              "args": {"bundle_index": 0}})
 
             elif decision == "card_select":
-                # Auto-select first card
+                # Auto-select required number of cards
                 cards = state.get("cards", [])
+                min_sel = state.get("min_select", 1)
+                max_sel = state.get("max_select", 1)
                 if cards:
-                    state = send({"cmd": "action", "action": "select_cards",
-                                 "args": {"indices": "0"}})
+                    n_pick = min(len(cards), max(min_sel, 1) if max_sel > 0 else 0)
+                    if n_pick > 0:
+                        chosen = rng.sample(cards, n_pick)
+                        indices_str = ",".join(str(c["index"]) for c in chosen)
+                        state = send({"cmd": "action", "action": "select_cards",
+                                     "args": {"indices": indices_str}})
+                    else:
+                        state = send({"cmd": "action", "action": "skip_select"})
                 else:
                     state = send({"cmd": "action", "action": "skip_select"})
 
             elif decision == "shop":
-                state = send({"cmd": "action", "action": "leave_room"})
-
+                if state.get("is_blitz_shop"):
+                    choices_rem = state.get("blitz_choices_remaining", 0)
+                    shop_loc = (ctx.get("act"), ctx.get("floor"))
+                    tried = blitz_shop_tried.setdefault(shop_loc, set())
+                    available = [
+                        e for e in state.get("blitz_entries", [])
+                        if e.get("available", e.get("is_stocked", False))
+                        and e["index"] not in tried
+                    ]
+                    if choices_rem > 0 and available:
+                        pick = rng.choice(available)
+                        tried.add(pick["index"])
+                        state = send({
+                            "cmd": "action",
+                            "action": "buy_blitz_entry",
+                            "args": {"index": pick["index"]},
+                        })
+                    else:
+                        state = send({"cmd": "action", "action": "leave_room"})
+                else:
+                    state = send({"cmd": "action", "action": "leave_room"})
             elif decision == "unknown":
                 state = send({"cmd": "action", "action": "proceed"})
 
@@ -306,6 +352,15 @@ def main():
     parser.add_argument("character", nargs="?", default="Ironclad",
                         choices=VALID_CHARACTERS, metavar="character",
                         help=f"Character to play as (default: Ironclad). Choices: {', '.join(VALID_CHARACTERS)}")
+    parser.add_argument("--mode", type=str.lower, default="standard",
+                        choices=["standard", "blitz"],
+                        help="Game mode: standard or blitz (default: standard)")
+    parser.add_argument("--blitz", action="store_true",
+                        help="Shorthand for --mode blitz")
+    parser.add_argument("--ascension", type=int, default=0,
+                        help="Ascension level (0-10 for Standard, 0-5 for Blitz)")
+    parser.add_argument("--no-log", action="store_true",
+                        help="Disable game logging")
     args = parser.parse_args()
 
     if args.num_runs <= 0:
@@ -313,15 +368,18 @@ def main():
 
     num_runs = args.num_runs
     character = args.character
+    game_mode = "Blitz" if (args.blitz or args.mode == "blitz") else "Standard"
+    ascension = args.ascension
 
-    print(f"Playing {num_runs} runs as {character}")
+    print(f"Playing {num_runs} {game_mode} A{ascension} runs as {character}")
     print("=" * 60)
 
     results = []
     for i in range(num_runs):
         seed = f"run_{i+1}"
         print(f"\n--- Run {i+1}/{num_runs} (seed: {seed}) ---")
-        result = play_run(seed, character, verbose=True)
+        result = play_run(seed, character, verbose=True, log=not args.no_log,
+                          game_mode=game_mode, ascension=ascension)
         results.append(result)
         print()
 
