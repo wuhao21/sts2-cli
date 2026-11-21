@@ -81,8 +81,15 @@ public struct Callable
     public static Callable From(Action action) => new(action);
     public static Callable From<T>(Action<T> action) => new(action);
     public static Callable From<T1, T2>(Action<T1, T2> action) => new(action);
+    public static Callable From<TResult>(Func<TResult> func) => new(func);
+    public static Callable From<T, TResult>(Func<T, TResult> func) => new(func);
+    public static Callable From<T1, T2, TResult>(Func<T1, T2, TResult> func) => new(func);
 
-    public void Call(params Variant[] args) => (_delegate as Action)?.Invoke();
+    public void Call(params Variant[] args)
+    {
+        if (_delegate is Action a) a();
+        else if (_delegate != null && _delegate.Method.GetParameters().Length == 0) _delegate.DynamicInvoke();
+    }
     public void CallDeferred(params Variant[] args) => Call(args);
 }
 
